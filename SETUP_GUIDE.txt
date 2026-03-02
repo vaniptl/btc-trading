@@ -1,0 +1,162 @@
+# BTC Strategy — Mobile Setup Guide
+# =====================================
+# Free stack: Telegram + Streamlit + GitHub Actions + Google Sheets
+# Total cost: $0/month
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — TELEGRAM BOT (10 minutes)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Open Telegram → search @BotFather
+2. Send /newbot → give it a name (e.g. "BTC Signal Bot")
+3. Copy the TOKEN it gives you → save it
+
+4. Get your chat ID:
+   a. Start @userinfobot in Telegram
+   b. It replies with your chat ID (a number like 123456789)
+   c. Save this number
+
+Your bot token looks like: 1234567890:ABCdef...
+Your chat ID looks like:    987654321
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — GITHUB REPO (5 minutes)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Create new GitHub repo (can be private)
+2. Upload ALL files from this project to the repo root
+
+Folder structure in GitHub:
+  /
+  ├── core/
+  │   └── signal_runner.py
+  ├── telegram_bot/
+  │   └── bot.py
+  ├── streamlit_app/
+  │   └── app.py
+  ├── cron/
+  │   └── hourly_signal.py
+  ├── .github/
+  │   └── workflows/
+  │       └── signal_cron.yml
+  └── requirements.txt
+
+3. Add GitHub Secrets (Settings → Secrets → Actions → New):
+   Secret Name                Value
+   ──────────────────────     ─────────────────────────────
+   CRYPTOCOMPARE_API_KEY    → your key from cryptocompare.com
+   TELEGRAM_BOT_TOKEN       → token from BotFather
+   TELEGRAM_CHAT_IDS        → your chat ID (e.g. 987654321)
+   GOOGLE_SHEETS_WEBHOOK    → (leave blank for now)
+
+4. Add GitHub Variables (Settings → Variables → Actions → New):
+   Variable Name        Value
+   ──────────────────   ──────
+   MIN_SCORE            5.0
+   MIN_CATEGORIES       2
+   ATR_SL_MULT          2.0
+   ATR_TP_MULT          4.0
+   TREND_REQUIRED       true
+   ENABLE_SHORTS        true
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — GITHUB ACTIONS (automatic, runs every hour)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Once the repo is on GitHub with the .github/workflows/ folder,
+Actions will auto-run every hour.
+
+To trigger manually:
+  GitHub → Actions tab → "BTC Signal Hourly Cron" → Run workflow
+
+It will:
+  • Fetch live BTC data
+  • Compute all 13 indicators
+  • Send Telegram message ONLY if LONG or SHORT signal fires
+  • Stay silent if no signal (⚪ NONE) — no spam
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — STREAMLIT DASHBOARD (5 minutes)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Go to share.streamlit.io → Sign in with GitHub
+2. Click "New app"
+3. Select your repo
+4. Set Main file path: streamlit_app/app.py
+5. Click Advanced → Secrets → paste contents of secrets.toml
+   (fill in your real API key)
+6. Deploy!
+
+You get a URL like: https://yourapp.streamlit.app
+Bookmark it on your phone. Works perfectly on mobile.
+
+Features:
+  📡 Signal tab  — live signal, scores, entry plan, charts
+  📊 Backtest    — period selector, custom params, equity curve, trade log
+  📋 History     — all past runs, download JSON
+  🧠 Learn       — best config recommendation, sensitivity analysis
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — GOOGLE SHEETS TRADE LOG (optional, 10 min)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Create a new Google Sheet
+2. Open Apps Script (Extensions → Apps Script)
+3. Paste this code:
+
+function doPost(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  var data  = JSON.parse(e.postData.contents);
+  var row   = [
+    data.timestamp || new Date().toISOString(),
+    data.direction || data.price || "",
+    data.long_score || "",
+    data.short_score || "",
+    data.reasons || "",
+    JSON.stringify(data)
+  ];
+  sheet.appendRow(row);
+  return ContentService.createTextOutput("OK");
+}
+
+4. Deploy as Web App:
+   - Execute as: Me
+   - Who has access: Anyone
+5. Copy the Web App URL
+6. Add to GitHub Secrets as: GOOGLE_SHEETS_WEBHOOK
+
+Now every signal + trade auto-logs to your Google Sheet.
+Open Sheets on your phone to see the full trade history.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW IT ALL WORKS TOGETHER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+GitHub Actions (every hour, FREE):
+  → Fetches live BTC data
+  → Runs 13 indicators
+  → If LONG or SHORT: pushes Telegram notification
+  → Logs to Google Sheets
+
+Your Phone:
+  → Telegram: instant push notification when signal fires
+  → Streamlit: full dashboard in browser when you want charts
+  → Google Sheets: full trade log, always synced
+
+Telegram bot commands (works anywhere):
+  /signal    → live signal right now
+  /backtest 1Y  → run backtest, save to memory
+  /learn     → what have past runs taught us?
+  /status    → system health
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+COSTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GitHub Actions:   FREE (2000 min/month — you use ~300)
+  Streamlit Cloud:  FREE
+  Telegram Bot:     FREE
+  Google Sheets:    FREE
+  CryptoCompare:    FREE (with free API key)
+  Binance Futures:  FREE (public endpoints, no auth needed)
+  ─────────────────────
+  TOTAL:            $0/month
