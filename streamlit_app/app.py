@@ -54,6 +54,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
 import signal_runner as sr
 
 
