@@ -1,234 +1,476 @@
 """
-signal_runner.py — Shared core used by Telegram bot, Streamlit, and GitHub Actions.
-Fetches live data, computes all indicators, returns structured signal + backtest results.
+signal_runner.py — BTC Strategy v6 Backend
+All indicator logic, data fetching, scoring engine for Streamlit app.
+v6 new: EMA50, Fib 0.5, RSI hidden div, CVD absorption, real buying pressure,
+        S/R for 1H/4H/1D, Binance primary data source, daily trade history.
 """
 
 import os, json, time, requests
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-# ── Config from environment variables (set in GitHub Secrets / Streamlit Secrets) ──
-CC_API_KEY   = os.environ.get("CRYPTOCOMPARE_API_KEY", "")
-INIT_CASH    = float(os.environ.get("INIT_CASH", "10000"))
-FEES         = float(os.environ.get("FEES", "0.001"))
-SLIPPAGE     = float(os.environ.get("SLIPPAGE", "0.0005"))
-MIN_SCORE    = float(os.environ.get("MIN_SCORE", "5.0"))
-MIN_CATS     = int(os.environ.get("MIN_CATEGORIES", "2"))
-TREND_REQ    = os.environ.get("TREND_REQUIRED", "true").lower() == "true"
-ATR_SL       = float(os.environ.get("ATR_SL_MULT", "2.0"))
-ATR_TP       = float(os.environ.get("ATR_TP_MULT", "4.0"))
-ENABLE_SHORT = os.environ.get("ENABLE_SHORTS", "true").lower() == "true"
+# ══════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════
 
-MEMORY_FILE  = Path(os.environ.get("MEMORY_FILE", "btc_backtest_memory.json"))
-SHEETS_URL   = os.environ.get("GOOGLE_SHEETS_WEBHOOK", "")   # optional
+CRYPTOCOMPARE_API_KEY = os.environ.get("CRYPTOCOMPARE_API_KEY", "")
 
-CAT_WEIGHTS = {
-    "4h_bias": 3.0, "ema_ribbon": 2.0, "ema200": 1.5, "bos": 2.0, "choch": 1.0,
-    "support_resistance": 2.5, "fib618": 2.0, "fib382": 1.5, "order_blocks": 2.5,
-    "vwap": 1.0, "rsi": 1.5, "rsi_div": 2.5, "cvd": 2.0, "volume": 0.5,
-    "liquidations": 2.0, "funding": 1.5, "oi": 1.5,
-}
+INIT_CASH    = 10_000.0
+FEES         = 0.001
+SLIPPAGE     = 0.0005
+ATR_SL       = 2.0
+ATR_TP       = 4.0
+MIN_SCORE    = 5.0
+MIN_CATS     = 2
+TREND_REQ    = True
+ENABLE_SHORT = True
 
 PERIOD_DAYS = {"1M": 30, "3M": 90, "6M": 180, "1Y": 365, "3Y": 1095}
+MEMORY_FILE = Path(__file__).parent / "btc_backtest_memory.json"
+
+BINANCE_SPOT_URL  = "https://api.binance.com/api/v3/klines"
+BINANCE_FAPI_URL  = "https://fapi.binance.com/fapi/v1"
+BINANCE_FDATA_URL = "https://fapi.binance.com/futures/data"
+
+INTERVAL_MS = {
+    "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
+}
+
+CAT_WEIGHTS = {
+    # TIER 5 — Core trend
+    "4h_bias":            3.0,
+    "ema200":             3.0,
+    "ema50":              2.5,
+    "ema_ribbon":         2.0,
+    "bos":                2.5,
+    # TIER 4 — Key levels
+    "support_resistance": 2.5,
+    "fib618":             2.0,
+    "fib50":              1.5,
+    "fib382":             1.5,
+    "order_blocks":       2.5,
+    # TIER 3 — Momentum
+    "rsi":                2.0,
+    "rsi_div":            2.5,
+    "rsi_hidden_div":     2.0,
+    "cvd":                2.0,
+    "cvd_div":            2.5,
+    "real_buying":        2.0,
+    # TIER 2 — Positioning
+    "choch":              1.0,
+    "vwap":               1.0,
+    "liquidations":       2.0,
+    "funding":            1.5,
+    "oi":                 1.5,
+    # TIER 1 — Supplementary
+    "volume":             0.5,
+}
 
 
 # ══════════════════════════════════════════════════════════════════
 # DATA FETCHERS
 # ══════════════════════════════════════════════════════════════════
 
-def fetch_ohlcv(unit="hour", aggregate=1, days_back=365, limit=2000):
-    endpoints = {
-        "minute": "https://min-api.cryptocompare.com/data/v2/histominute",
-        "hour":   "https://min-api.cryptocompare.com/data/v2/histohour",
-        "day":    "https://min-api.cryptocompare.com/data/v2/histoday",
-    }
-    headers = {}
-    if CC_API_KEY and CC_API_KEY != "YOUR_CRYPTOCOMPARE_KEY_HERE":
-        headers["authorization"] = f"Apikey {CC_API_KEY}"
+def fetch_ohlcv_binance(symbol="BTCUSDT", interval="1h", days_back=365):
+    end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = end_ms - int(days_back * 86_400_000)
+    ms_step  = INTERVAL_MS.get(interval, 3_600_000)
+    all_data, cur_start = [], start_ms
 
-    mins_per  = {"minute": aggregate, "hour": 60*aggregate, "day": 1440*aggregate}[unit]
-    total     = min(int(days_back * 1440 / mins_per), limit)
-    all_data, to_ts, remaining = [], None, total
-
-    while remaining > 0:
-        params = {"fsym": "BTC", "tsym": "USD",
-                  "limit": min(2000, remaining), "aggregate": aggregate}
-        if to_ts: params["toTs"] = to_ts
+    while cur_start < end_ms:
         try:
-            r    = requests.get(endpoints[unit], params=params, headers=headers, timeout=15)
-            data = r.json()
-            if data.get("Response") != "Success": break
-            candles = data["Data"]["Data"]
-            if not candles: break
-            all_data  = candles + all_data
-            to_ts     = candles[0]["time"] - 1
-            remaining -= len(candles)
-            time.sleep(0.1)
-        except: break
+            r = requests.get(BINANCE_SPOT_URL, params={
+                "symbol": symbol, "interval": interval,
+                "startTime": cur_start, "endTime": end_ms, "limit": 1000
+            }, timeout=20)
+            r.raise_for_status()
+            batch = r.json()
+            if not batch:
+                break
+            all_data.extend(batch)
+            cur_start = batch[-1][0] + ms_step
+            if len(batch) < 1000:
+                break
+            time.sleep(0.12)
+        except Exception:
+            break
 
-    if not all_data: return pd.DataFrame()
-    df = pd.DataFrame(all_data)
-    df["datetime"] = pd.to_datetime(df["time"], unit="s")
-    df = df.set_index("datetime").rename(columns={"volumefrom": "volume"})
-    df = df[["open","high","low","close","volume"]].astype(float)
+    if not all_data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_data, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_vol", "num_trades", "tbv", "tbq", "ignore"
+    ])
+    df["datetime"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_localize(None)
+    df = df.set_index("datetime")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df[["open", "high", "low", "close", "volume"]]
     df = df[df["volume"] > 0].sort_index()
     return df[~df.index.duplicated(keep="last")]
 
-def fetch_liquidations(max_days=30):
-    url, all_orders = "https://fapi.binance.com/fapi/v1/allForceOrders", []
-    end_ms, day_ms = int(time.time()*1000), 86_400_000
+
+def fetch_ohlcv_cc(symbol="BTC", currency="USD", unit="hour",
+                   aggregate=1, days_back=365):
+    endpoints = {
+        "hour": "https://min-api.cryptocompare.com/data/v2/histohour",
+        "day":  "https://min-api.cryptocompare.com/data/v2/histoday",
+    }
+    headers = {}
+    if CRYPTOCOMPARE_API_KEY:
+        headers["authorization"] = f"Apikey {CRYPTOCOMPARE_API_KEY}"
+    mins_per   = {"hour": 60 * aggregate, "day": 1440 * aggregate}[unit]
+    total_need = int(days_back * 1440 / mins_per)
+    all_data, to_ts, fetched = [], None, 0
+
+    while fetched < total_need:
+        params = {"fsym": symbol, "tsym": currency,
+                  "limit": min(2000, total_need - fetched), "aggregate": aggregate}
+        if to_ts:
+            params["toTs"] = to_ts
+        try:
+            resp = requests.get(endpoints[unit], params=params,
+                                headers=headers, timeout=15)
+            data = resp.json()
+            if data.get("Response") != "Success":
+                break
+            candles = data["Data"]["Data"]
+            if not candles:
+                break
+            all_data = candles + all_data
+            to_ts    = candles[0]["time"] - 1
+            fetched += len(candles)
+            time.sleep(0.15)
+        except Exception:
+            break
+
+    if not all_data:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_data)
+    df["datetime"] = pd.to_datetime(df["time"], unit="s")
+    df = df.set_index("datetime").rename(columns={"volumefrom": "volume"})
+    df = df[["open", "high", "low", "close", "volume"]].astype(float)
+    df = df[df["volume"] > 0].sort_index()
+    return df[~df.index.duplicated(keep="last")]
+
+
+def fetch_ohlcv(unit="hour", aggregate=1, days_back=365):
+    """Smart wrapper: Binance → CryptoCompare fallback."""
+    interval_map = {("hour", 1): "1h", ("hour", 4): "4h", ("day", 1): "1d"}
+    interval = interval_map.get((unit, aggregate), "1h")
+    df = fetch_ohlcv_binance("BTCUSDT", interval, days_back)
+    if df.empty:
+        df = fetch_ohlcv_cc("BTC", "USD", unit, aggregate, days_back)
+    return df
+
+
+def fetch_liquidations(symbol="BTCUSDT", limit=1000, max_days=30):
+    url, all_orders = f"{BINANCE_FAPI_URL}/allForceOrders", []
+    end_ms, day_ms  = int(time.time() * 1000), 86_400_000
     for _ in range(max_days):
         start_ms = end_ms - day_ms
         try:
-            r = requests.get(url, params={"symbol":"BTCUSDT","startTime":start_ms,
-                                           "endTime":end_ms,"limit":1000}, timeout=15)
+            r   = requests.get(url, params={"symbol": symbol, "startTime": start_ms,
+                               "endTime": end_ms, "limit": 1000}, timeout=15)
             raw = r.json()
-            if isinstance(raw, list): all_orders.extend(raw)
-            if len(all_orders) >= 1000: break
-        except: break
-        end_ms = start_ms; time.sleep(0.08)
-    if not all_orders: return pd.DataFrame()
-    df = pd.DataFrame(all_orders[:1000])
-    df["datetime"] = pd.to_datetime(df["time"], unit="ms")
-    df = df.set_index("datetime").sort_index()
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    df["qty"]   = pd.to_numeric(df["executedQty"], errors="coerce")
+            if isinstance(raw, list):
+                all_orders.extend(raw)
+            if len(all_orders) >= limit:
+                break
+        except Exception:
+            break
+        end_ms = start_ms
+        time.sleep(0.08)
+    if not all_orders:
+        return pd.DataFrame()
+    df = pd.DataFrame(all_orders[:limit])
+    df["datetime"]      = pd.to_datetime(df["time"], unit="ms")
+    df                  = df.set_index("datetime").sort_index()
+    df["price"]         = pd.to_numeric(df["price"],       errors="coerce")
+    df["qty"]           = pd.to_numeric(df["executedQty"], errors="coerce")
     df["liq_usd"]       = df["price"] * df["qty"]
-    df["long_liq_usd"]  = df.apply(lambda r: r["liq_usd"] if r["side"]=="SELL" else 0.0, axis=1)
-    df["short_liq_usd"] = df.apply(lambda r: r["liq_usd"] if r["side"]=="BUY"  else 0.0, axis=1)
+    df["long_liq_usd"]  = df.apply(lambda r: r["liq_usd"] if r["side"] == "SELL" else 0.0, axis=1)
+    df["short_liq_usd"] = df.apply(lambda r: r["liq_usd"] if r["side"] == "BUY"  else 0.0, axis=1)
     return df
 
-def fetch_funding():
-    try:
-        r = requests.get("https://fapi.binance.com/fapi/v1/fundingRate",
-                         params={"symbol":"BTCUSDT","limit":1000}, timeout=15)
-        raw = r.json()
-        if not isinstance(raw, list) or not raw: return pd.DataFrame()
-        df = pd.DataFrame(raw)
-        tc = next((c for c in ["fundingTime","calcTime","time"] if c in df.columns), None)
-        if not tc: return pd.DataFrame()
-        df["datetime"]     = pd.to_datetime(pd.to_numeric(df[tc], errors="coerce"), unit="ms")
-        df["funding_rate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
-        return df.dropna(subset=["datetime"]).set_index("datetime").sort_index()[["funding_rate"]].dropna()
-    except: return pd.DataFrame()
 
-def fetch_oi():
+def fetch_funding(symbol="BTCUSDT", limit=1000):
     try:
-        r = requests.get("https://fapi.binance.com/futures/data/openInterestHist",
-                         params={"symbol":"BTCUSDT","period":"1h","limit":500}, timeout=15)
+        r   = requests.get(f"{BINANCE_FAPI_URL}/fundingRate",
+                           params={"symbol": symbol, "limit": limit}, timeout=15)
         raw = r.json()
-        if not isinstance(raw, list) or not raw: return pd.DataFrame()
+        if not isinstance(raw, list) or not raw:
+            return pd.DataFrame()
+        df = pd.DataFrame(raw)
+        tc = next((c for c in ["fundingTime", "calcTime", "time"] if c in df.columns), None)
+        if not tc:
+            return pd.DataFrame()
+        df["datetime"]     = pd.to_datetime(pd.to_numeric(df[tc], errors="coerce"), unit="ms")
+        df                 = df.dropna(subset=["datetime"]).set_index("datetime").sort_index()
+        df["funding_rate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
+        return df[["funding_rate"]].dropna()
+    except Exception:
+        return pd.DataFrame()
+
+
+def fetch_oi(symbol="BTCUSDT", period="1h", limit=500):
+    try:
+        r   = requests.get(f"{BINANCE_FDATA_URL}/openInterestHist",
+                           params={"symbol": symbol, "period": period, "limit": limit}, timeout=15)
+        raw = r.json()
+        if not isinstance(raw, list) or not raw:
+            return pd.DataFrame()
         df = pd.DataFrame(raw)
         tc = next((c for c in df.columns if "time" in c.lower()), None)
-        if not tc: return pd.DataFrame()
+        if not tc:
+            return pd.DataFrame()
         df["datetime"] = pd.to_datetime(pd.to_numeric(df[tc], errors="coerce"), unit="ms")
+        df             = df.dropna(subset=["datetime"]).set_index("datetime").sort_index()
         df["oi"]       = pd.to_numeric(df["sumOpenInterest"], errors="coerce")
-        return df.dropna(subset=["datetime"]).set_index("datetime").sort_index()[["oi"]].dropna()
-    except: return pd.DataFrame()
-
-def get_live_price():
-    try:
-        r = requests.get("https://min-api.cryptocompare.com/data/price",
-                         params={"fsym":"BTC","tsyms":"USD"}, timeout=5)
-        return float(r.json().get("USD", 0))
-    except: return 0.0
+        return df[["oi"]].dropna()
+    except Exception:
+        return pd.DataFrame()
 
 
 # ══════════════════════════════════════════════════════════════════
-# INDICATORS
+# INDICATOR HELPERS
 # ══════════════════════════════════════════════════════════════════
 
-def _ema(s, p): return s.ewm(span=p, adjust=False).mean()
-def _rsi(c, p=14):
-    d = c.diff()
+def _ema(s, p):
+    return s.ewm(span=p, adjust=False).mean()
+
+def _rsi(close, p=14):
+    d  = close.diff()
     ag = d.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
     al = (-d.clip(upper=0)).ewm(alpha=1/p, adjust=False).mean()
     return 100 - (100 / (1 + ag / al.replace(0, np.nan)))
+
 def _atr(df, p=14):
     h, l, c = df["high"], df["low"], df["close"]
-    tr = pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
     return tr.ewm(span=p, adjust=False).mean()
 
-def compute_indicators(df, df_4h, liq_df, fund_df, oi_df):
-    df = df.copy()
+
+# ══════════════════════════════════════════════════════════════════
+# S/R + FIBONACCI
+# ══════════════════════════════════════════════════════════════════
+
+def find_sr_levels(df_tf, swing=5, label="1H"):
+    """Returns nearest support/resistance and full level list for a timeframe."""
+    if df_tf is None or df_tf.empty:
+        return {"levels": [], "nearest_support": None, "nearest_resistance": None, "label": label}
+
+    h_v = df_tf["high"].values
+    l_v = df_tf["low"].values
+    cur = float(df_tf["close"].iloc[-1])
+    s   = swing
+
+    ph, pl = [], []
+    for i in range(s, len(df_tf) - s):
+        if h_v[i] == max(h_v[i-s:i+s+1]): ph.append(round(float(h_v[i]), 2))
+        if l_v[i] == min(l_v[i-s:i+s+1]): pl.append(round(float(l_v[i]), 2))
+
+    def dedup(vals, tol=0.003):
+        vals = sorted(set(vals))
+        out  = []
+        for v in vals:
+            if not out or abs(v - out[-1]) / out[-1] > tol:
+                out.append(v)
+        return out
+
+    supports    = [v for v in dedup(pl) if v < cur]
+    resistances = [v for v in dedup(ph) if v > cur]
+
+    levels  = [{"price": v, "type": "support",    "timeframe": label} for v in supports[-5:]]
+    levels += [{"price": v, "type": "resistance", "timeframe": label} for v in resistances[:5]]
+
+    return {
+        "levels":            levels,
+        "nearest_support":   supports[-1]    if supports    else None,
+        "nearest_resistance": resistances[0] if resistances else None,
+        "label":             label,
+    }
+
+
+def compute_fibonacci(df_tf, lookback=100, label="1H"):
+    """Returns fib 0.382, 0.5, 0.618 with actual price values."""
+    if df_tf is None or df_tf.empty:
+        return {"label": label, "fib382": 0, "fib50": 0, "fib618": 0,
+                "anchor_high": 0, "anchor_low": 0, "trend": "unknown"}
+    r    = df_tf.tail(lookback)
+    sh   = float(r["high"].max())
+    sl   = float(r["low"].min())
+    diff = sh - sl
+    down = r["high"].idxmax() < r["low"].idxmin()
+
+    if down:
+        f382, f50, f618 = sl + diff*0.382, sl + diff*0.500, sl + diff*0.618
+    else:
+        f382, f50, f618 = sh - diff*0.382, sh - diff*0.500, sh - diff*0.618
+
+    return {
+        "label":       label,
+        "anchor_high": round(sh,   2),
+        "anchor_low":  round(sl,   2),
+        "fib382":      round(f382, 2),
+        "fib50":       round(f50,  2),
+        "fib618":      round(f618, 2),
+        "trend":       "down" if down else "up",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# INDICATOR ENGINE
+# ══════════════════════════════════════════════════════════════════
+
+def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
+    df = df_1h.copy()
+
+    # ── EMAs (8, 21, 50, 55, 200) ────────────────────────────────
     df["ema8"]   = _ema(df["close"], 8)
     df["ema21"]  = _ema(df["close"], 21)
+    df["ema50"]  = _ema(df["close"], 50)
     df["ema55"]  = _ema(df["close"], 55)
     df["ema200"] = _ema(df["close"], 200)
     df["rsi"]    = _rsi(df["close"])
     df["atr"]    = _atr(df)
 
-    tp = (df["high"]+df["low"]+df["close"])/3
-    df["vwap"] = (tp*df["volume"]).cumsum()/df["volume"].cumsum()
+    df["ema50_above_200"] = df["ema50"] > df["ema200"]
+    df["golden_cross"]    = (df["ema50"] > df["ema200"]) & (df["ema50"].shift(1) <= df["ema200"].shift(1))
+    df["death_cross"]     = (df["ema50"] < df["ema200"]) & (df["ema50"].shift(1) >= df["ema200"].shift(1))
 
-    hl = (df["high"]-df["low"]).replace(0,np.nan)
-    df["cvd"] = (df["volume"]*((df["close"]-df["low"])/hl-(df["high"]-df["close"])/hl)).cumsum()
+    # ── VWAP ─────────────────────────────────────────────────────
+    tp         = (df["high"] + df["low"] + df["close"]) / 3
+    df["vwap"] = (tp * df["volume"]).cumsum() / df["volume"].cumsum()
 
-    vol_ma = df["volume"].rolling(20).mean()
-    vol_std = df["volume"].rolling(20).std()
-    df["vol_confirm"] = df["volume"] > vol_ma
-    df["vol_spike"]   = df["volume"] > (vol_ma + 2*vol_std)
-    df["vol_ratio"]   = df["volume"] / vol_ma
+    # ── CVD ──────────────────────────────────────────────────────
+    hl         = (df["high"] - df["low"]).replace(0, np.nan)
+    df["cvd"]  = (df["volume"] * ((df["close"]-df["low"])/hl - (df["high"]-df["close"])/hl)).cumsum()
 
-    h_v, l_v, c_v = df["high"].values, df["low"].values, df["close"].values
-    ph, pl = [], []
-    for i in range(3, len(df)-3):
-        if h_v[i] == max(h_v[i-3:i+4]): ph.append(h_v[i])
-        if l_v[i] == min(l_v[i-3:i+4]): pl.append(l_v[i])
-    cur = c_v[-1]
+    # ── CVD divergence (absorption) ──────────────────────────────
+    cvd_v  = df["cvd"].values
+    c_vals = df["close"].values
+    cvd_bull, cvd_bear = [False]*len(df), [False]*len(df)
+    for i in range(20, len(df)):
+        p = i - 10
+        if np.isnan(cvd_v[i]) or np.isnan(cvd_v[p]):
+            continue
+        if c_vals[i] < c_vals[p] and cvd_v[i] > cvd_v[p]:
+            cvd_bull[i] = True
+        if c_vals[i] > c_vals[p] and cvd_v[i] < cvd_v[p]:
+            cvd_bear[i] = True
+    df["cvd_bull_div"] = cvd_bull
+    df["cvd_bear_div"] = cvd_bear
+
+    # ── Real buying pressure ──────────────────────────────────────
+    vol_ma             = df["volume"].rolling(20).mean()
+    vol_std            = df["volume"].rolling(20).std()
+    df["vol_confirm"]  = df["volume"] > vol_ma
+    df["vol_spike"]    = df["volume"] > (vol_ma + 2*vol_std)
+    df["vol_ratio"]    = df["volume"] / vol_ma
+    cvd_rising         = df["cvd"].diff() > 0
+    cvd_falling        = df["cvd"].diff() < 0
+    price_up           = df["close"].pct_change() > 0
+    price_down         = df["close"].pct_change() < 0
+    df["real_buying"]  = cvd_rising  & price_up   & df["vol_confirm"]
+    df["real_selling"] = cvd_falling & price_down & df["vol_confirm"]
+
+    # ── S/R (1H) ─────────────────────────────────────────────────
+    h_v, l_v = df["high"].values, df["low"].values
+    cur = float(df["close"].iloc[-1])
+    s, ph, pl = 3, [], []
+    for i in range(s, len(df)-s):
+        if h_v[i] == max(h_v[i-s:i+s+1]): ph.append(h_v[i])
+        if l_v[i] == min(l_v[i-s:i+s+1]): pl.append(l_v[i])
     df["near_support"]    = pd.Series(False, index=df.index)
     df["near_resistance"] = pd.Series(False, index=df.index)
     for lvl in [v for v in pl if v < cur]:
-        df["near_support"] |= (df["close"]-lvl).abs()/lvl < 0.005
+        df["near_support"]    |= (df["close"]-lvl).abs()/lvl < 0.005
     for lvl in [v for v in ph if v > cur]:
         df["near_resistance"] |= (df["close"]-lvl).abs()/lvl < 0.005
 
-    r100 = df.tail(100)
-    sh, sl = r100["high"].max(), r100["low"].min()
-    diff   = sh - sl
-    down   = r100["high"].idxmax() < r100["low"].idxmin()
-    fib382 = sl+diff*0.382 if down else sh-diff*0.382
-    fib618 = sl+diff*0.618 if down else sh-diff*0.618
-    df["near_fib618"] = (df["close"]-fib618).abs()/df["close"] < 0.008
+    # ── Fibonacci (0.382, 0.5, 0.618) ────────────────────────────
+    r100  = df.tail(100)
+    sh    = float(r100["high"].max())
+    sl    = float(r100["low"].min())
+    diff  = sh - sl
+    down  = r100["high"].idxmax() < r100["low"].idxmin()
+    fib382 = sl + diff*0.382 if down else sh - diff*0.382
+    fib50  = sl + diff*0.500 if down else sh - diff*0.500
+    fib618 = sl + diff*0.618 if down else sh - diff*0.618
     df["near_fib382"] = (df["close"]-fib382).abs()/df["close"] < 0.008
+    df["near_fib50"]  = (df["close"]-fib50).abs()/df["close"]  < 0.008
+    df["near_fib618"] = (df["close"]-fib618).abs()/df["close"] < 0.008
+    df.attrs["fib382_price"] = round(fib382, 2)
+    df.attrs["fib50_price"]  = round(fib50,  2)
+    df.attrs["fib618_price"] = round(fib618, 2)
+    df.attrs["fib_high"]     = round(sh, 2)
+    df.attrs["fib_low"]      = round(sl, 2)
 
+    # ── Order blocks ─────────────────────────────────────────────
     opens, closes = df["open"].values, df["close"].values
-    atr_v = _atr(df).values
+    atr_v  = _atr(df).values
     df["in_bullish_ob"] = pd.Series(False, index=df.index)
     df["in_bearish_ob"] = pd.Series(False, index=df.index)
     for i in range(2, len(df)-2):
         a = atr_v[i]
-        if np.isnan(a) or a == 0: continue
-        if closes[i] < opens[i] and closes[i+2]-closes[i] > 2.0*a:
-            df["in_bullish_ob"] |= (df["close"]>=min(opens[i],closes[i]))&(df["close"]<=max(opens[i],closes[i]))
-        if closes[i] > opens[i] and closes[i]-closes[i+2] > 2.0*a:
-            df["in_bearish_ob"] |= (df["close"]>=min(opens[i],closes[i]))&(df["close"]<=max(opens[i],closes[i]))
+        if np.isnan(a) or a == 0:
+            continue
+        if closes[i] < opens[i] and closes[i+2] - closes[i] > 2.0*a:
+            df["in_bullish_ob"] |= ((df["close"] >= min(opens[i],closes[i])) &
+                                    (df["close"] <= max(opens[i],closes[i])))
+        if closes[i] > opens[i] and closes[i] - closes[i+2] > 2.0*a:
+            df["in_bearish_ob"] |= ((df["close"] >= min(opens[i],closes[i])) &
+                                    (df["close"] <= max(opens[i],closes[i])))
 
-    rsi_v, c_vals = df["rsi"].values, df["close"].values
+    # ── RSI — regular + hidden divergence ────────────────────────
+    rsi_v  = df["rsi"].values
     rsi_bull, rsi_bear = [False]*len(df), [False]*len(df)
+    rsi_hbull, rsi_hbear = [False]*len(df), [False]*len(df)
     for i in range(55, len(df)):
-        p = i-5
-        if np.isnan(rsi_v[i]) or np.isnan(rsi_v[p]): continue
-        if c_vals[i] < c_vals[p] and rsi_v[i] > rsi_v[p] and rsi_v[i] < 40: rsi_bull[i] = True
-        if c_vals[i] > c_vals[p] and rsi_v[i] < rsi_v[p] and rsi_v[i] > 60: rsi_bear[i] = True
-    df["rsi_bull_div"], df["rsi_bear_div"] = rsi_bull, rsi_bear
+        p = i - 5
+        if np.isnan(rsi_v[i]) or np.isnan(rsi_v[p]):
+            continue
+        if c_vals[i] < c_vals[p] and rsi_v[i] > rsi_v[p] and rsi_v[i] < 40:
+            rsi_bull[i] = True
+        if c_vals[i] > c_vals[p] and rsi_v[i] < rsi_v[p] and rsi_v[i] > 60:
+            rsi_bear[i] = True
+        if c_vals[i] > c_vals[p] and rsi_v[i] < rsi_v[p] and 30 < rsi_v[i] < 55:
+            rsi_hbull[i] = True
+        if c_vals[i] < c_vals[p] and rsi_v[i] > rsi_v[p] and 45 < rsi_v[i] < 70:
+            rsi_hbear[i] = True
+    df["rsi_bull_div"]        = rsi_bull
+    df["rsi_bear_div"]        = rsi_bear
+    df["rsi_hidden_bull_div"] = rsi_hbull
+    df["rsi_hidden_bear_div"] = rsi_hbear
 
-    bos_up, bos_down, choch = [False]*len(df), [False]*len(df), [False]*len(df)
+    # RSI trend-zone (per TECHNICALS.docx)
+    is_up  = df["close"] > df["ema200"]
+    is_dn  = df["close"] < df["ema200"]
+    df["rsi_trend_bull_zone"] = is_up & (df["rsi"] >= 30) & (df["rsi"] <= 50)
+    df["rsi_trend_bear_zone"] = is_dn & (df["rsi"] >= 50) & (df["rsi"] <= 70)
+
+    # ── Market structure (BOS / CHoCH) ───────────────────────────
+    bos_up, bos_dn, choch = [False]*len(df), [False]*len(df), [False]*len(df)
     trend = "neutral"
-    hv2, lv2 = df["high"].values, df["low"].values
+    h_v2, l_v2 = df["high"].values, df["low"].values
     for i in range(5, len(df)-5):
-        if hv2[i] == max(hv2[i-5:i+6]):
+        if h_v2[i] == max(h_v2[i-5:i+6]):
             if trend == "bullish":   bos_up[i]  = True
             elif trend == "bearish": choch[i]   = True
             trend = "bullish"
-        if lv2[i] == min(lv2[i-5:i+6]):
-            if trend == "bearish":   bos_down[i] = True
-            elif trend == "bullish": choch[i]    = True
+        if l_v2[i] == min(l_v2[i-5:i+6]):
+            if trend == "bearish":   bos_dn[i]  = True
+            elif trend == "bullish": choch[i]   = True
             trend = "bearish"
-    df["bos_up"], df["bos_down"], df["choch"] = bos_up, bos_down, choch
+    df["bos_up"]   = bos_up
+    df["bos_down"] = bos_dn
+    df["choch"]    = choch
 
+    # ── 4H Bias ──────────────────────────────────────────────────
     if not df_4h.empty:
         e4     = _ema(df_4h["close"], 21)
         e4_200 = _ema(df_4h["close"], 200)
@@ -236,255 +478,431 @@ def compute_indicators(df, df_4h, liq_df, fund_df, oi_df):
         df["bias_bullish_4h"] = bias.resample("1h").ffill().reindex(df.index, method="ffill").fillna(False)
         df["bias_bearish_4h"] = (~bias).resample("1h").ffill().reindex(df.index, method="ffill").fillna(False)
     else:
-        df["bias_bullish_4h"] = False; df["bias_bearish_4h"] = False
+        df["bias_bullish_4h"] = False
+        df["bias_bearish_4h"] = False
 
-    df["major_long_liq"] = False; df["major_short_liq"] = False
+    # ── Liquidations ─────────────────────────────────────────────
+    df["major_long_liq"]  = False
+    df["major_short_liq"] = False
     if not liq_df.empty and "long_liq_usd" in liq_df.columns:
-        lh = liq_df[["long_liq_usd","short_liq_usd"]].resample("1h").sum()
-        df["major_long_liq"]  = (lh["long_liq_usd"]  > lh["long_liq_usd"].quantile(0.90)).reindex(df.index, fill_value=False)
-        df["major_short_liq"] = (lh["short_liq_usd"] > lh["short_liq_usd"].quantile(0.90)).reindex(df.index, fill_value=False)
+        lh     = liq_df[["long_liq_usd", "short_liq_usd"]].resample("1h").sum()
+        lt_thr = lh["long_liq_usd"].quantile(0.90)
+        st_thr = lh["short_liq_usd"].quantile(0.90)
+        df["major_long_liq"]  = (lh["long_liq_usd"]  > lt_thr).reindex(df.index, fill_value=False)
+        df["major_short_liq"] = (lh["short_liq_usd"] > st_thr).reindex(df.index, fill_value=False)
 
-    df["funding_extreme_long"] = False; df["funding_extreme_short"] = False
+    # ── Funding ──────────────────────────────────────────────────
+    df["funding_extreme_long"]  = False
+    df["funding_extreme_short"] = False
     if not fund_df.empty:
         fr = fund_df["funding_rate"].resample("1h").ffill().reindex(df.index, method="ffill")
         df["funding_extreme_long"]  = fr >  0.0005
         df["funding_extreme_short"] = fr < -0.0001
 
-    df["oi_confirm_long"] = False; df["oi_confirm_short"] = False
+    # ── OI ───────────────────────────────────────────────────────
+    df["oi_confirm_long"]  = False
+    df["oi_confirm_short"] = False
     if not oi_df.empty:
         oi_s  = oi_df["oi"].resample("1h").last().reindex(df.index, method="ffill")
         oi_ch = oi_s.pct_change()
         df["oi_confirm_long"]  = (df["close"].pct_change() > 0) & (oi_ch > 0.005)
         df["oi_confirm_short"] = (df["close"].pct_change() < 0) & (oi_ch > 0.005)
 
-    return df.dropna(subset=["ema200","rsi","atr"])
+    return df.dropna(subset=["ema200", "rsi", "atr"])
 
-def compute_scores(df):
-    w  = CAT_WEIGHTS
-    tl = pd.Series(0.0, index=df.index); ts = pd.Series(0.0, index=df.index)
-    zl = pd.Series(0.0, index=df.index); zs = pd.Series(0.0, index=df.index)
-    ml = pd.Series(0.0, index=df.index); ms = pd.Series(0.0, index=df.index)
-    pl = pd.Series(0.0, index=df.index); ps = pd.Series(0.0, index=df.index)
 
-    tl += df["bias_bullish_4h"].astype(float)*w["4h_bias"];   ts += df["bias_bearish_4h"].astype(float)*w["4h_bias"]
-    bull_ema = (df["ema8"]>df["ema21"])&(df["ema21"]>df["ema55"])
-    bear_ema = (df["ema8"]<df["ema21"])&(df["ema21"]<df["ema55"])
-    tl += bull_ema.astype(float)*w["ema_ribbon"];              ts += bear_ema.astype(float)*w["ema_ribbon"]
-    tl += (df["close"]>df["ema200"]).astype(float)*w["ema200"];ts += (df["close"]<df["ema200"]).astype(float)*w["ema200"]
-    tl += df["bos_up"].astype(float)*w["bos"];                 ts += df["bos_down"].astype(float)*w["bos"]
-    tl += df["choch"].astype(float)*w["choch"];                ts += df["choch"].astype(float)*w["choch"]
+# ══════════════════════════════════════════════════════════════════
+# SCORING ENGINE
+# ══════════════════════════════════════════════════════════════════
 
-    zl += df["near_support"].astype(float)*w["support_resistance"];    zs += df["near_resistance"].astype(float)*w["support_resistance"]
-    zl += df["near_fib618"].astype(float)*w["fib618"];                 zs += df["near_fib618"].astype(float)*w["fib618"]
-    zl += df["near_fib382"].astype(float)*w["fib382"];                 zs += df["near_fib382"].astype(float)*w["fib382"]
-    zl += df["in_bullish_ob"].astype(float)*w["order_blocks"];         zs += df["in_bearish_ob"].astype(float)*w["order_blocks"]
-    zl += (df["close"]<df["vwap"]).astype(float)*w["vwap"];            zs += (df["close"]>df["vwap"]).astype(float)*w["vwap"]
+def compute_scores(df, w=None, min_score=None, min_cats=None,
+                   trend_req=None, enable_shorts=None):
+    if w           is None: w           = CAT_WEIGHTS
+    if min_score   is None: min_score   = MIN_SCORE
+    if min_cats    is None: min_cats    = MIN_CATS
+    if trend_req   is None: trend_req   = TREND_REQ
+    if enable_shorts is None: enable_shorts = ENABLE_SHORT
 
-    ml += (df["rsi"]<40).astype(float)*w["rsi"];              ms += (df["rsi"]>60).astype(float)*w["rsi"]
-    ml += df["rsi_bull_div"].astype(float)*w["rsi_div"];       ms += df["rsi_bear_div"].astype(float)*w["rsi_div"]
-    cvd_up = df["cvd"].diff()>0; cvd_dn = df["cvd"].diff()<0
-    ml += cvd_up.astype(float)*w["cvd"];                       ms += cvd_dn.astype(float)*w["cvd"]
-    ml += df["vol_confirm"].astype(float)*w["volume"];         ms += df["vol_confirm"].astype(float)*w["volume"]
+    z = pd.Series(0.0, index=df.index)
 
-    pl += df["major_long_liq"].astype(float)*w["liquidations"];        ps += df["major_short_liq"].astype(float)*w["liquidations"]
-    pl += df["funding_extreme_short"].astype(float)*w["funding"];      ps += df["funding_extreme_long"].astype(float)*w["funding"]
-    pl += df["oi_confirm_long"].astype(float)*w["oi"];                 ps += df["oi_confirm_short"].astype(float)*w["oi"]
+    # Trend
+    tl  = z.copy(); ts = z.copy()
+    tl += df["bias_bullish_4h"].astype(float)                              * w["4h_bias"]
+    ts += df["bias_bearish_4h"].astype(float)                              * w["4h_bias"]
+    bull_ema = (df["ema8"]>df["ema21"]) & (df["ema21"]>df["ema55"])
+    bear_ema = (df["ema8"]<df["ema21"]) & (df["ema21"]<df["ema55"])
+    tl += bull_ema.astype(float)                                           * w["ema_ribbon"]
+    ts += bear_ema.astype(float)                                           * w["ema_ribbon"]
+    tl += (df["close"] > df["ema50"]).astype(float)                        * w["ema50"]
+    ts += (df["close"] < df["ema50"]).astype(float)                        * w["ema50"]
+    tl += (df["close"] > df["ema200"]).astype(float)                       * w["ema200"]
+    ts += (df["close"] < df["ema200"]).astype(float)                       * w["ema200"]
+    tl += df["bos_up"].astype(float)                                       * w["bos"]
+    ts += df["bos_down"].astype(float)                                     * w["bos"]
 
-    df["long_score"]  = tl+zl+ml+pl
-    df["short_score"] = ts+zs+ms+ps
-    df["trend_l"],  df["trend_s"]  = tl, ts
-    df["zone_l"],   df["zone_s"]   = zl, zs
-    df["mom_l"],    df["mom_s"]    = ml, ms
-    df["pos_l"],    df["pos_s"]    = pl, ps
+    # Zone
+    zl  = z.copy(); zs = z.copy()
+    zl += df["near_support"].astype(float)                                 * w["support_resistance"]
+    zs += df["near_resistance"].astype(float)                              * w["support_resistance"]
+    zl += df["near_fib618"].astype(float)                                  * w["fib618"]
+    zs += df["near_fib618"].astype(float)                                  * w["fib618"]
+    zl += df["near_fib50"].astype(float)                                   * w.get("fib50", 1.5)
+    zs += df["near_fib50"].astype(float)                                   * w.get("fib50", 1.5)
+    zl += df["near_fib382"].astype(float)                                  * w["fib382"]
+    zs += df["near_fib382"].astype(float)                                  * w["fib382"]
+    zl += df["in_bullish_ob"].astype(float)                                * w["order_blocks"]
+    zs += df["in_bearish_ob"].astype(float)                                * w["order_blocks"]
+    zl += (df["close"] < df["vwap"]).astype(float)                         * w["vwap"]
+    zs += (df["close"] > df["vwap"]).astype(float)                         * w["vwap"]
 
-    def gate(tcat, zcat, mcat, pcat):
-        cats_active = (tcat>0).astype(int)+(zcat>0).astype(int)+(mcat>0).astype(int)+(pcat>0).astype(int)
-        score_ok    = (tcat+zcat+mcat+pcat) >= MIN_SCORE
-        cats_ok     = cats_active >= MIN_CATS
-        trend_ok    = (tcat>0) if TREND_REQ else pd.Series(True, index=tcat.index)
-        return score_ok & cats_ok & trend_ok
+    # Momentum
+    ml  = z.copy(); ms = z.copy()
+    ml += (df["rsi"] < 40).astype(float)                                   * w["rsi"]
+    ms += (df["rsi"] > 60).astype(float)                                   * w["rsi"]
+    ml += df["rsi_trend_bull_zone"].astype(float)                          * (w["rsi"] * 0.5)
+    ms += df["rsi_trend_bear_zone"].astype(float)                          * (w["rsi"] * 0.5)
+    ml += df["rsi_bull_div"].astype(float)                                 * w["rsi_div"]
+    ms += df["rsi_bear_div"].astype(float)                                 * w["rsi_div"]
+    ml += df["rsi_hidden_bull_div"].astype(float)                          * w.get("rsi_hidden_div", 2.0)
+    ms += df["rsi_hidden_bear_div"].astype(float)                          * w.get("rsi_hidden_div", 2.0)
+    cvd_up   = df["cvd"].diff() > 0
+    cvd_down = df["cvd"].diff() < 0
+    ml += cvd_up.astype(float)                                             * w["cvd"]
+    ms += cvd_down.astype(float)                                           * w["cvd"]
+    ml += df["cvd_bull_div"].astype(float)                                 * w.get("cvd_div", 2.5)
+    ms += df["cvd_bear_div"].astype(float)                                 * w.get("cvd_div", 2.5)
+    ml += df["real_buying"].astype(float)                                  * w.get("real_buying", 2.0)
+    ms += df["real_selling"].astype(float)                                 * w.get("real_buying", 2.0)
+    ml += df["vol_confirm"].astype(float)                                  * w["volume"]
+    ms += df["vol_confirm"].astype(float)                                  * w["volume"]
+
+    # Positioning
+    pl  = z.copy(); ps = z.copy()
+    pl += df["choch"].astype(float)                                        * w["choch"]
+    ps += df["choch"].astype(float)                                        * w["choch"]
+    pl += df["major_long_liq"].astype(float)                               * w["liquidations"]
+    ps += df["major_short_liq"].astype(float)                              * w["liquidations"]
+    pl += df["funding_extreme_short"].astype(float)                        * w["funding"]
+    ps += df["funding_extreme_long"].astype(float)                         * w["funding"]
+    pl += df["oi_confirm_long"].astype(float)                              * w["oi"]
+    ps += df["oi_confirm_short"].astype(float)                             * w["oi"]
+
+    df["long_score"]  = tl + zl + ml + pl
+    df["short_score"] = ts + zs + ms + ps
+
+    def gate(t, z, m, p):
+        cats_active = ((t > 0).astype(int) + (z > 0).astype(int) +
+                       (m > 0).astype(int) + (p > 0).astype(int))
+        score_ok = (t + z + m + p) >= min_score
+        cats_ok  = cats_active >= min_cats
+        t_ok     = (t > 0) if trend_req else pd.Series(True, index=t.index)
+        return score_ok & cats_ok & t_ok
 
     df["long_signal"]  = gate(tl, zl, ml, pl)
-    df["short_signal"] = gate(ts, zs, ms, ps) & ENABLE_SHORT
+    df["short_signal"] = gate(ts, zs, ms, ps) & enable_shorts
+    df["trend_l"] = tl;  df["trend_s"] = ts
+    df["zone_l"]  = zl;  df["zone_s"]  = zs
+    df["mom_l"]   = ml;  df["mom_s"]   = ms
+    df["pos_l"]   = pl;  df["pos_s"]   = ps
     return df
 
 
 # ══════════════════════════════════════════════════════════════════
-# MAIN SIGNAL FUNCTION (called by all components)
+# LIVE SIGNAL
 # ══════════════════════════════════════════════════════════════════
 
-def get_signal(bars=300):
-    """Returns a rich signal dict. bars=300 gives ~12 days of 1H context."""
-    days_needed = max(bars // 24 + 5, 15)
-    df_1h  = fetch_ohlcv("hour", 1,  days_back=days_needed)
-    df_4h  = fetch_ohlcv("hour", 4,  days_back=days_needed*4)
-    liq_df = fetch_liquidations(max_days=3)
-    fund_df= fetch_funding()
-    oi_df  = fetch_oi()
-    price  = get_live_price()
+def get_signal():
+    try:
+        # Live price
+        try:
+            rp = requests.get("https://api.binance.com/api/v3/ticker/price",
+                              params={"symbol": "BTCUSDT"}, timeout=5)
+            price = float(rp.json()["price"])
+        except Exception:
+            price = 0.0
 
-    if df_1h.empty:
-        return {"error": "Could not fetch OHLCV data. Check API key."}
+        df_1h  = fetch_ohlcv("hour", 1, days_back=10)
+        df_4h  = fetch_ohlcv("hour", 4, days_back=40)
+        df_1d  = fetch_ohlcv("day",  1, days_back=60)
+        liq    = fetch_liquidations(max_days=3)
+        fund   = fetch_funding()
+        oi     = fetch_oi()
 
-    df = compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df)
-    df = compute_scores(df)
+        if df_1h.empty:
+            return {"error": "No OHLCV data available"}
 
-    row = df.iloc[-1]
-    ls  = float(row["long_score"]);    ss  = float(row["short_score"])
-    tl  = float(row["trend_l"]);       ts  = float(row["trend_s"])
-    zl  = float(row["zone_l"]);        zs  = float(row["zone_s"])
-    ml  = float(row["mom_l"]);         ms_ = float(row["mom_s"])
-    posl= float(row["pos_l"]);         poss= float(row["pos_s"])
+        df = compute_indicators(df_1h, df_4h, liq, fund, oi, df_1d)
+        df = compute_scores(df)
 
-    lsig = bool(row["long_signal"])
-    ssig = bool(row["short_signal"])
+        row = df.iloc[-1]
+        if price == 0.0:
+            price = float(row["close"])
 
-    if lsig:   direction = "LONG"
-    elif ssig: direction = "SHORT"
-    else:      direction = "NONE"
+        ls   = float(row["long_score"])
+        ss   = float(row["short_score"])
+        lsig = bool(row["long_signal"])
+        ssig = bool(row["short_signal"])
+        atr  = float(row["atr"])
 
-    atr_v = float(row["atr"])
-    rsi_v = float(row["rsi"])
+        direction = "LONG" if lsig else ("SHORT" if ssig else "NONE")
 
-    entry_plan = None
-    if lsig:
-        entry_plan = {
-            "entry":       round(price, 2),
-            "stop_loss":   round(price - atr_v*ATR_SL, 2),
-            "take_profit": round(price + atr_v*ATR_TP, 2),
-            "rr":          round(ATR_TP/ATR_SL, 1),
+        # S/R for all timeframes
+        sr_1h = find_sr_levels(df_1h, swing=5, label="1H")
+        sr_4h = find_sr_levels(df_4h, swing=3, label="4H")
+        sr_1d = find_sr_levels(df_1d, swing=3, label="1D") if not df_1d.empty else {}
+
+        # Fibonacci for all timeframes
+        fib_1h = compute_fibonacci(df_1h, lookback=100, label="1H")
+        fib_4h = compute_fibonacci(df_4h, lookback=60,  label="4H")
+        fib_1d = compute_fibonacci(df_1d, lookback=30,  label="1D") if not df_1d.empty else {}
+
+        # Entry plan
+        entry_plan = None
+        if lsig or ssig:
+            if lsig:
+                entry_plan = {
+                    "entry":       round(price, 2),
+                    "stop_loss":   round(price - atr * ATR_SL, 2),
+                    "take_profit": round(price + atr * ATR_TP, 2),
+                    "rr":          round(ATR_TP / ATR_SL, 1),
+                }
+            else:
+                entry_plan = {
+                    "entry":       round(price, 2),
+                    "stop_loss":   round(price + atr * ATR_SL, 2),
+                    "take_profit": round(price - atr * ATR_TP, 2),
+                    "rr":          round(ATR_TP / ATR_SL, 1),
+                }
+
+        # Build reasons
+        ema50_v  = float(row["ema50"])
+        ema200_v = float(row["ema200"])
+        is_up    = price > ema200_v
+
+        reasons_long, reasons_short = [], []
+        indicator_checks = [
+            ("4H Bias Bullish",     bool(row.get("bias_bullish_4h")),                True,  False),
+            ("4H Bias Bearish",     bool(row.get("bias_bearish_4h")),                False, True),
+            ("EMA Ribbon Bull",     bool((row["ema8"]>row["ema21"])&(row["ema21"]>row["ema55"])), True, False),
+            ("EMA Ribbon Bear",     bool((row["ema8"]<row["ema21"])&(row["ema21"]<row["ema55"])), False, True),
+            ("Above EMA50",         bool(price > ema50_v),                           True,  False),
+            ("Below EMA50",         bool(price < ema50_v),                           False, True),
+            ("Above EMA200",        bool(price > ema200_v),                          True,  False),
+            ("Below EMA200",        bool(price < ema200_v),                          False, True),
+            ("Golden Cross",        bool(row.get("golden_cross", False)),            True,  False),
+            ("Death Cross",         bool(row.get("death_cross",  False)),            False, True),
+            ("BOS Up",              bool(row.get("bos_up")),                         True,  False),
+            ("BOS Down",            bool(row.get("bos_down")),                       False, True),
+            ("Near Support",        bool(row.get("near_support")),                   True,  False),
+            ("Near Resistance",     bool(row.get("near_resistance")),                False, True),
+            ("Fib 0.618",           bool(row.get("near_fib618")),                    True,  True),
+            ("Fib 0.500",           bool(row.get("near_fib50")),                     True,  True),
+            ("Fib 0.382",           bool(row.get("near_fib382")),                    True,  True),
+            ("Bullish OB",          bool(row.get("in_bullish_ob")),                  True,  False),
+            ("Bearish OB",          bool(row.get("in_bearish_ob")),                  False, True),
+            ("Below VWAP",          bool(price < row.get("vwap", price+1)),          True,  False),
+            ("Above VWAP",          bool(price > row.get("vwap", price-1)),          False, True),
+            ("RSI Oversold",        bool(row["rsi"] < 40),                           True,  False),
+            ("RSI Overbought",      bool(row["rsi"] > 60),                           False, True),
+            ("RSI Bull Zone",       bool(row.get("rsi_trend_bull_zone")),            True,  False),
+            ("RSI Bear Zone",       bool(row.get("rsi_trend_bear_zone")),            False, True),
+            ("RSI Bull Div",        bool(row.get("rsi_bull_div")),                   True,  False),
+            ("RSI Bear Div",        bool(row.get("rsi_bear_div")),                   False, True),
+            ("RSI Hidden Bull Div", bool(row.get("rsi_hidden_bull_div")),            True,  False),
+            ("RSI Hidden Bear Div", bool(row.get("rsi_hidden_bear_div")),            False, True),
+            ("CVD Bull Div",        bool(row.get("cvd_bull_div")),                   True,  False),
+            ("CVD Bear Div",        bool(row.get("cvd_bear_div")),                   False, True),
+            ("Real Buying",         bool(row.get("real_buying")),                    True,  False),
+            ("Real Selling",        bool(row.get("real_selling")),                   False, True),
+            ("Vol Confirm",         bool(row.get("vol_confirm")),                    True,  True),
+            ("Long Liq",            bool(row.get("major_long_liq")),                 True,  False),
+            ("Short Liq",           bool(row.get("major_short_liq")),                False, True),
+            ("Funding Short Ext",   bool(row.get("funding_extreme_short")),          True,  False),
+            ("Funding Long Ext",    bool(row.get("funding_extreme_long")),           False, True),
+            ("OI Long",             bool(row.get("oi_confirm_long")),                True,  False),
+            ("OI Short",            bool(row.get("oi_confirm_short")),               False, True),
+        ]
+        for name, active, is_long_ind, is_short_ind in indicator_checks:
+            if active:
+                if is_long_ind:  reasons_long.append(name)
+                if is_short_ind: reasons_short.append(name)
+
+        # RSI zone label
+        rsi_v = float(row["rsi"])
+        if is_up and 30 <= rsi_v <= 50:
+            rsi_zone = "Bull Buy Zone (30-50)"
+        elif not is_up and 50 <= rsi_v <= 70:
+            rsi_zone = "Bear Sell Zone (50-70)"
+        elif rsi_v < 30:
+            rsi_zone = "Oversold"
+        elif rsi_v > 70:
+            rsi_zone = "Overbought"
+        else:
+            rsi_zone = "Neutral"
+
+        return {
+            "direction":    direction,
+            "price":        price,
+            "timestamp":    datetime.utcnow().isoformat(),
+            "long_score":   round(ls, 2),
+            "short_score":  round(ss, 2),
+            "long_signal":  lsig,
+            "short_signal": ssig,
+            "entry_plan":   entry_plan,
+            "reasons_long":  reasons_long,
+            "reasons_short": reasons_short,
+            "categories": {
+                "trend":       {"long": round(float(row["trend_l"]),2), "short": round(float(row["trend_s"]),2)},
+                "zone":        {"long": round(float(row["zone_l"]),2),  "short": round(float(row["zone_s"]),2)},
+                "momentum":    {"long": round(float(row["mom_l"]),2),   "short": round(float(row["mom_s"]),2)},
+                "positioning": {"long": round(float(row["pos_l"]),2),   "short": round(float(row["pos_s"]),2)},
+            },
+            "indicators": {
+                "rsi":       round(rsi_v, 1),
+                "rsi_zone":  rsi_zone,
+                "atr":       round(atr, 0),
+                "vol_ratio": round(float(row.get("vol_ratio", 1)), 2),
+                "vwap":      round(float(row.get("vwap", 0)), 2),
+                "ema50":     round(ema50_v, 2),
+                "ema200":    round(ema200_v, 2),
+                "ema200_cross": "Golden" if ema50_v > ema200_v else "Death",
+                "real_buying":  bool(row.get("real_buying")),
+                "real_selling": bool(row.get("real_selling")),
+                "cvd_bull_div": bool(row.get("cvd_bull_div")),
+                "cvd_bear_div": bool(row.get("cvd_bear_div")),
+            },
+            "sr": {
+                "1H": sr_1h,
+                "4H": sr_4h,
+                "1D": sr_1d,
+            },
+            "fibonacci": {
+                "1H": fib_1h,
+                "4H": fib_4h,
+                "1D": fib_1d,
+            },
+            "df": df,
         }
-    elif ssig:
-        entry_plan = {
-            "entry":       round(price, 2),
-            "stop_loss":   round(price + atr_v*ATR_SL, 2),
-            "take_profit": round(price - atr_v*ATR_TP, 2),
-            "rr":          round(ATR_TP/ATR_SL, 1),
-        }
+    except Exception as e:
+        return {"error": str(e)}
 
-    # Per-indicator active reasons
-    reasons_long, reasons_short = [], []
-    indicator_map = [
-        ("4H Bias Bullish",    bool(row.get("bias_bullish_4h")),    False),
-        ("4H Bias Bearish",    False,                                bool(row.get("bias_bearish_4h"))),
-        ("EMA Ribbon Bull",    bool((row["ema8"]>row["ema21"])and(row["ema21"]>row["ema55"])), False),
-        ("EMA Ribbon Bear",    False, bool((row["ema8"]<row["ema21"])and(row["ema21"]<row["ema55"]))),
-        ("Above EMA200",       bool(row["close"]>row["ema200"]),     False),
-        ("Below EMA200",       False,                                bool(row["close"]<row["ema200"])),
-        ("BOS Up",             bool(row.get("bos_up")),              False),
-        ("BOS Down",           False,                                bool(row.get("bos_down"))),
-        ("CHoCH",              bool(row.get("choch")),               bool(row.get("choch"))),
-        ("Near Support",       bool(row.get("near_support")),        False),
-        ("Near Resistance",    False,                                bool(row.get("near_resistance"))),
-        ("Fib 0.618",          bool(row.get("near_fib618")),         bool(row.get("near_fib618"))),
-        ("Fib 0.382",          bool(row.get("near_fib382")),         bool(row.get("near_fib382"))),
-        ("Bullish OB",         bool(row.get("in_bullish_ob")),       False),
-        ("Bearish OB",         False,                                bool(row.get("in_bearish_ob"))),
-        ("Below VWAP",         bool(row["close"]<row["vwap"]),       False),
-        ("Above VWAP",         False,                                bool(row["close"]>row["vwap"])),
-        (f"RSI Oversold {rsi_v:.0f}", bool(rsi_v<40), False),
-        (f"RSI Overbought {rsi_v:.0f}", False, bool(rsi_v>60)),
-        ("RSI Bull Div",       bool(row.get("rsi_bull_div")),        False),
-        ("RSI Bear Div",       False,                                bool(row.get("rsi_bear_div"))),
-        ("CVD Rising",         bool(row.get("cvd",0)>0),             False),
-        ("CVD Falling",        False,                                bool(row.get("cvd",0)<0)),
-        ("Vol Confirm",        bool(row.get("vol_confirm")),         bool(row.get("vol_confirm"))),
-        ("Long Liq Cascade",   bool(row.get("major_long_liq")),      False),
-        ("Short Liq Cascade",  False,                                bool(row.get("major_short_liq"))),
-        ("Funding Short",      bool(row.get("funding_extreme_short")),False),
-        ("Funding Long",       False,                                bool(row.get("funding_extreme_long"))),
-        ("OI Long Confirm",    bool(row.get("oi_confirm_long")),      False),
-        ("OI Short Confirm",   False,                                bool(row.get("oi_confirm_short"))),
-    ]
-    for name, for_long, for_short in indicator_map:
-        if for_long:  reasons_long.append(name)
-        if for_short: reasons_short.append(name)
 
-    return {
-        "timestamp":     datetime.utcnow().isoformat(),
-        "price":         round(price, 2),
-        "direction":     direction,
-        "long_score":    round(ls, 2),
-        "short_score":   round(ss, 2),
-        "categories": {
-            "trend":       {"long": round(tl,2), "short": round(ts,2)},
-            "zone":        {"long": round(zl,2), "short": round(zs,2)},
-            "momentum":    {"long": round(ml,2), "short": round(ms_,2)},
-            "positioning": {"long": round(posl,2),"short": round(poss,2)},
-        },
-        "reasons_long":  reasons_long,
-        "reasons_short": reasons_short,
-        "entry_plan":    entry_plan,
-        "indicators": {
-            "rsi":      round(rsi_v, 2),
-            "atr":      round(atr_v, 2),
-            "ema200":   round(float(row["ema200"]), 2),
-            "vwap":     round(float(row["vwap"]), 2),
-            "vol_ratio":round(float(row.get("vol_ratio",1)), 2),
-        },
-        "df": df,   # returned for streamlit charts — stripped before sending to Telegram
+# ══════════════════════════════════════════════════════════════════
+# DAILY TRADE HISTORY
+# ══════════════════════════════════════════════════════════════════
+
+def build_daily_trade_history(pf, init_cash=None):
+    """
+    Takes a vectorbt portfolio and returns:
+      - trades_df:  every trade with entry/exit/pnl/balance
+      - daily_df:   per-day P&L summary
+      - weekly_df:  per-week rollup
+      - monthly_df: per-month rollup
+    """
+    if init_cash is None:
+        init_cash = INIT_CASH
+
+    try:
+        raw = pf.trades.records_readable.copy()
+    except Exception:
+        return {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    if raw.empty:
+        return {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # Normalise columns
+    raw.columns = [c.lower().replace(" ", "_") for c in raw.columns]
+
+    def fc(*candidates):
+        for c in candidates:
+            if c in raw.columns: return c
+        return None
+
+    td = pd.DataFrame()
+    td["entry_time"]  = pd.to_datetime(raw[fc("entry_time",  "open_time")],  errors="coerce")
+    td["exit_time"]   = pd.to_datetime(raw[fc("exit_time",   "close_time")], errors="coerce")
+    td["direction"]   = raw[fc("direction", "side", "type")].astype(str).str.upper() if fc("direction","side","type") else "LONG"
+    td["entry_price"] = pd.to_numeric(raw[fc("entry_price", "avg_entry_price", "open_price")], errors="coerce")
+    td["exit_price"]  = pd.to_numeric(raw[fc("exit_price",  "avg_exit_price",  "close_price")], errors="coerce")
+    td["pnl"]         = pd.to_numeric(raw[fc("pnl", "p&l", "realized_pnl")], errors="coerce")
+    td["exit_reason"] = raw[fc("exit_type", "close_reason", "status")].astype(str) if fc("exit_type","close_reason","status") else "Unknown"
+
+    ret_col = fc("return", "pnl_pct", "return_pct")
+    td["pnl_pct"] = (pd.to_numeric(raw[ret_col], errors="coerce") * 100) if ret_col else (td["pnl"] / init_cash * 100)
+
+    td["win"]        = td["pnl"] > 0
+    td["entry_date"] = td["entry_time"].dt.date
+    td["exit_date"]  = td["exit_time"].dt.date
+    td = td.sort_values("exit_time").reset_index(drop=True)
+    td["balance"]    = init_cash + td["pnl"].cumsum()
+
+    # Daily summary
+    daily = td.groupby("exit_date").agg(
+        trades   =("pnl",  "count"),
+        wins     =("win",  "sum"),
+        net_pnl  =("pnl",  "sum"),
+        best_pnl =("pnl",  "max"),
+        worst_pnl=("pnl",  "min"),
+    ).reset_index()
+    daily["wr"]          = (daily["wins"] / daily["trades"]).round(3)
+    daily["cum_pnl"]     = daily["net_pnl"].cumsum()
+    daily["balance_eod"] = init_cash + daily["cum_pnl"]
+
+    # Weekly rollup
+    td["exit_week"] = td["exit_time"].dt.to_period("W")
+    weekly = td.groupby("exit_week").agg(
+        trades  =("pnl", "count"),
+        wins    =("win",  "sum"),
+        net_pnl =("pnl",  "sum"),
+    ).reset_index()
+    weekly["wr"]      = (weekly["wins"] / weekly["trades"]).round(3)
+    weekly["cum_pnl"] = weekly["net_pnl"].cumsum()
+    weekly["week_str"] = weekly["exit_week"].astype(str)
+
+    # Monthly rollup
+    td["exit_month"] = td["exit_time"].dt.to_period("M")
+    monthly = td.groupby("exit_month").agg(
+        trades  =("pnl", "count"),
+        wins    =("win",  "sum"),
+        net_pnl =("pnl",  "sum"),
+    ).reset_index()
+    monthly["wr"]       = (monthly["wins"] / monthly["trades"]).round(3)
+    monthly["cum_pnl"]  = monthly["net_pnl"].cumsum()
+    monthly["ret_pct"]  = (monthly["net_pnl"] / init_cash * 100).round(2)
+    monthly["month_str"] = monthly["exit_month"].astype(str)
+
+    summary = {
+        "total_trades": len(td),
+        "wins":         int(td["win"].sum()),
+        "losses":       len(td) - int(td["win"].sum()),
+        "win_rate":     round(float(td["win"].mean()), 3),
+        "total_pnl":    round(float(td["pnl"].sum()), 2),
+        "final_balance":round(float(td["balance"].iloc[-1]), 2) if len(td) > 0 else init_cash,
+        "best_trade":   round(float(td["pnl"].max()), 2) if len(td) > 0 else 0,
+        "worst_trade":  round(float(td["pnl"].min()), 2) if len(td) > 0 else 0,
+        "best_date":    str(td.loc[td["pnl"].idxmax(), "exit_date"]) if len(td) > 0 else "",
+        "worst_date":   str(td.loc[td["pnl"].idxmin(), "exit_date"]) if len(td) > 0 else "",
     }
 
+    return summary, td, daily, weekly, monthly
+
 
 # ══════════════════════════════════════════════════════════════════
-# MEMORY — Save / Load / Learn
+# MEMORY
 # ══════════════════════════════════════════════════════════════════
-
-def load_memory():
-    if MEMORY_FILE.exists():
-        try:
-            with open(MEMORY_FILE) as f:
-                return json.load(f)
-        except: pass
-    return []
 
 def save_to_memory(result: dict):
     mem = load_memory()
     mem.append(result)
     with open(MEMORY_FILE, "w") as f:
         json.dump(mem, f, indent=2, default=str)
-    return len(mem)
-
-def get_learning_summary():
-    mem = load_memory()
-    if not mem: return "No backtest history yet."
-    ranked = sorted(mem, key=lambda x: x.get("sharpe_ratio", 0), reverse=True)
-    best   = ranked[0]
-    lines  = [
-        f"📚 *Learning Report* — {len(mem)} runs",
-        f"",
-        f"🥇 *Best Run:* `{best['run_id']}`",
-        f"   Period: {best['period']} | Return: {best['total_return']:.1%}",
-        f"   Sharpe: {best['sharpe_ratio']:.3f} | WR: {best['win_rate']:.1%}",
-        f"   Config: min\\_score={best['config']['min_score']} | SL={best['config']['atr_sl_mult']}x | TP={best['config']['atr_tp_mult']}x",
-        f"",
-        f"📊 *All Runs (by Sharpe):*",
-    ]
-    for i, r in enumerate(ranked[:10]):
-        bh = "✅" if r.get("beat_bh") else "❌"
-        lines.append(f"  {i+1}. {r['period']} | {r['total_return']:+.1%} | SR={r['sharpe_ratio']:.2f} {bh}")
-    return "\n".join(lines)
 
 
-# ══════════════════════════════════════════════════════════════════
-# GOOGLE SHEETS LOGGER (optional)
-# ══════════════════════════════════════════════════════════════════
-
-def log_trade_to_sheets(trade: dict):
-    """POST a trade row to Google Sheets via Apps Script webhook."""
-    if not SHEETS_URL: return
+def load_memory():
+    if not MEMORY_FILE.exists():
+        return []
     try:
-        requests.post(SHEETS_URL, json=trade, timeout=10)
-    except: pass
-
-def log_signal_to_sheets(signal: dict):
-    if not SHEETS_URL: return
-    row = {
-        "timestamp":    signal["timestamp"],
-        "price":        signal["price"],
-        "direction":    signal["direction"],
-        "long_score":   signal["long_score"],
-        "short_score":  signal["short_score"],
-        "reasons":      ", ".join(signal.get("reasons_long" if signal["direction"]=="LONG" else "reasons_short", [])),
-    }
-    log_trade_to_sheets(row)
+        with open(MEMORY_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
