@@ -793,42 +793,71 @@ def get_signal():
 
 def build_daily_trade_history(pf, init_cash=None):
     """
-    Takes a vectorbt portfolio and returns:
-      - trades_df:  every trade with entry/exit/pnl/balance
-      - daily_df:   per-day P&L summary
-      - weekly_df:  per-week rollup
-      - monthly_df: per-month rollup
+    Robust trade history builder — handles any vectorbt version.
+    Inspects actual column names at runtime instead of assuming them.
+    Returns: (summary, trades_df, daily_df, weekly_df, monthly_df)
     """
     if init_cash is None:
         init_cash = INIT_CASH
 
+    empty = ({}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+
     try:
         raw = pf.trades.records_readable.copy()
     except Exception:
-        return {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return empty
 
     if raw.empty:
-        return {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return empty
 
-    # Normalise columns
-    raw.columns = [c.lower().replace(" ", "_") for c in raw.columns]
+    # Normalise column names: lowercase + replace spaces with underscores
+    raw.columns = [c.lower().strip().replace(" ", "_") for c in raw.columns]
+    cols = set(raw.columns)
 
     def fc(*candidates):
+        """Return first column name that exists, else None."""
         for c in candidates:
-            if c in raw.columns: return c
+            if c in cols:
+                return c
         return None
 
-    td = pd.DataFrame()
-    td["entry_time"]  = pd.to_datetime(raw[fc("entry_time",  "open_time")],  errors="coerce")
-    td["exit_time"]   = pd.to_datetime(raw[fc("exit_time",   "close_time")], errors="coerce")
-    td["direction"]   = raw[fc("direction", "side", "type")].astype(str).str.upper() if fc("direction","side","type") else "LONG"
-    td["entry_price"] = pd.to_numeric(raw[fc("entry_price", "avg_entry_price", "open_price")], errors="coerce")
-    td["exit_price"]  = pd.to_numeric(raw[fc("exit_price",  "avg_exit_price",  "close_price")], errors="coerce")
-    td["pnl"]         = pd.to_numeric(raw[fc("pnl", "p&l", "realized_pnl")], errors="coerce")
-    td["exit_reason"] = raw[fc("exit_type", "close_reason", "status")].astype(str) if fc("exit_type","close_reason","status") else "Unknown"
+    def get_col(col_name, default=None):
+        """Safely get a column by name, return default Series if missing."""
+        if col_name and col_name in cols:
+            return raw[col_name]
+        n = len(raw)
+        if default is None:
+            return pd.Series([np.nan] * n, index=raw.index)
+        return pd.Series([default] * n, index=raw.index)
 
-    ret_col = fc("return", "pnl_pct", "return_pct")
-    td["pnl_pct"] = (pd.to_numeric(raw[ret_col], errors="coerce") * 100) if ret_col else (td["pnl"] / init_cash * 100)
+    # ── Detect all possible column name variants ──────────────────
+    entry_time_col  = fc("entry_time",  "entry_idx",  "open_idx",   "open_time",  "start_time")
+    exit_time_col   = fc("exit_time",   "exit_idx",   "close_idx",  "close_time", "end_time")
+    entry_price_col = fc("entry_price", "avg_entry_price", "open_price",  "entry_bar_close")
+    exit_price_col  = fc("exit_price",  "avg_exit_price",  "close_price", "exit_bar_close")
+    pnl_col         = fc("pnl", "p&l", "realized_pnl", "profit_and_loss", "net_pnl")
+    dir_col         = fc("direction", "side", "type", "trade_type", "trade_side")
+    exit_type_col   = fc("exit_type", "close_reason", "exit_reason", "status", "close_type")
+    ret_col         = fc("return", "return_(%)", "pnl_pct", "return_pct", "ret", "pct_return")
+
+    # ── Build clean DataFrame ─────────────────────────────────────
+    td = pd.DataFrame(index=raw.index)
+
+    td["entry_time"]  = pd.to_datetime(get_col(entry_time_col), errors="coerce")
+    td["exit_time"]   = pd.to_datetime(get_col(exit_time_col),  errors="coerce")
+    td["direction"]   = get_col(dir_col, "Long").astype(str).str.upper()
+    td["entry_price"] = pd.to_numeric(get_col(entry_price_col), errors="coerce")
+    td["exit_price"]  = pd.to_numeric(get_col(exit_price_col),  errors="coerce")
+    td["pnl"]         = pd.to_numeric(get_col(pnl_col, 0),      errors="coerce").fillna(0)
+    td["exit_reason"] = get_col(exit_type_col, "Unknown").astype(str)
+
+    # PnL % — vbt sometimes stores as decimal (0.05) or percent (5.0)
+    if ret_col:
+        raw_ret = pd.to_numeric(raw[ret_col], errors="coerce")
+        # If median absolute value < 5, assume decimal → multiply by 100
+        td["pnl_pct"] = raw_ret * 100 if raw_ret.abs().median() < 5 else raw_ret
+    else:
+        td["pnl_pct"] = td["pnl"] / init_cash * 100
 
     td["win"]        = td["pnl"] > 0
     td["entry_date"] = td["entry_time"].dt.date
@@ -836,52 +865,52 @@ def build_daily_trade_history(pf, init_cash=None):
     td = td.sort_values("exit_time").reset_index(drop=True)
     td["balance"]    = init_cash + td["pnl"].cumsum()
 
-    # Daily summary
+    # ── Daily summary ─────────────────────────────────────────────
     daily = td.groupby("exit_date").agg(
-        trades   =("pnl",  "count"),
-        wins     =("win",  "sum"),
-        net_pnl  =("pnl",  "sum"),
-        best_pnl =("pnl",  "max"),
-        worst_pnl=("pnl",  "min"),
+        trades   =("pnl", "count"),
+        wins     =("win", "sum"),
+        net_pnl  =("pnl", "sum"),
+        best_pnl =("pnl", "max"),
+        worst_pnl=("pnl", "min"),
     ).reset_index()
     daily["wr"]          = (daily["wins"] / daily["trades"]).round(3)
     daily["cum_pnl"]     = daily["net_pnl"].cumsum()
     daily["balance_eod"] = init_cash + daily["cum_pnl"]
 
-    # Weekly rollup
+    # ── Weekly rollup ─────────────────────────────────────────────
     td["exit_week"] = td["exit_time"].dt.to_period("W")
     weekly = td.groupby("exit_week").agg(
         trades  =("pnl", "count"),
-        wins    =("win",  "sum"),
-        net_pnl =("pnl",  "sum"),
+        wins    =("win", "sum"),
+        net_pnl =("pnl", "sum"),
     ).reset_index()
-    weekly["wr"]      = (weekly["wins"] / weekly["trades"]).round(3)
-    weekly["cum_pnl"] = weekly["net_pnl"].cumsum()
+    weekly["wr"]       = (weekly["wins"] / weekly["trades"]).round(3)
+    weekly["cum_pnl"]  = weekly["net_pnl"].cumsum()
     weekly["week_str"] = weekly["exit_week"].astype(str)
 
-    # Monthly rollup
+    # ── Monthly rollup ────────────────────────────────────────────
     td["exit_month"] = td["exit_time"].dt.to_period("M")
     monthly = td.groupby("exit_month").agg(
         trades  =("pnl", "count"),
-        wins    =("win",  "sum"),
-        net_pnl =("pnl",  "sum"),
+        wins    =("win", "sum"),
+        net_pnl =("pnl", "sum"),
     ).reset_index()
-    monthly["wr"]       = (monthly["wins"] / monthly["trades"]).round(3)
-    monthly["cum_pnl"]  = monthly["net_pnl"].cumsum()
-    monthly["ret_pct"]  = (monthly["net_pnl"] / init_cash * 100).round(2)
+    monthly["wr"]        = (monthly["wins"] / monthly["trades"]).round(3)
+    monthly["cum_pnl"]   = monthly["net_pnl"].cumsum()
+    monthly["ret_pct"]   = (monthly["net_pnl"] / init_cash * 100).round(2)
     monthly["month_str"] = monthly["exit_month"].astype(str)
 
     summary = {
-        "total_trades": len(td),
-        "wins":         int(td["win"].sum()),
-        "losses":       len(td) - int(td["win"].sum()),
-        "win_rate":     round(float(td["win"].mean()), 3),
-        "total_pnl":    round(float(td["pnl"].sum()), 2),
-        "final_balance":round(float(td["balance"].iloc[-1]), 2) if len(td) > 0 else init_cash,
-        "best_trade":   round(float(td["pnl"].max()), 2) if len(td) > 0 else 0,
-        "worst_trade":  round(float(td["pnl"].min()), 2) if len(td) > 0 else 0,
-        "best_date":    str(td.loc[td["pnl"].idxmax(), "exit_date"]) if len(td) > 0 else "",
-        "worst_date":   str(td.loc[td["pnl"].idxmin(), "exit_date"]) if len(td) > 0 else "",
+        "total_trades":  len(td),
+        "wins":          int(td["win"].sum()),
+        "losses":        len(td) - int(td["win"].sum()),
+        "win_rate":      round(float(td["win"].mean()), 3),
+        "total_pnl":     round(float(td["pnl"].sum()), 2),
+        "final_balance": round(float(td["balance"].iloc[-1]), 2) if len(td) > 0 else init_cash,
+        "best_trade":    round(float(td["pnl"].max()), 2) if len(td) > 0 else 0,
+        "worst_trade":   round(float(td["pnl"].min()), 2) if len(td) > 0 else 0,
+        "best_date":     str(td.loc[td["pnl"].idxmax(), "exit_date"]) if len(td) > 0 else "",
+        "worst_date":    str(td.loc[td["pnl"].idxmin(), "exit_date"]) if len(td) > 0 else "",
     }
 
     return summary, td, daily, weekly, monthly
