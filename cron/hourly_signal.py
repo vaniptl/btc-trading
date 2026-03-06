@@ -8,12 +8,21 @@ Always logs to Google Sheets if webhook is set.
 import os, sys, asyncio, logging
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "core"))
+# Explicitly load signal_runner from core/ — avoids any path confusion
+_core = Path(__file__).parent.parent / "core"
+sys.path.insert(0, str(_core))
 
+# Verify we're loading the right file before importing
+_sr_path = _core / "signal_runner.py"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("cron")
+log.info(f"Loading signal_runner from: {_sr_path}")
+log.info(f"log_signal_to_sheets present: {_sr_path.exists()}")
 
-import signal_runner as sr
+import importlib.util
+_spec = importlib.util.spec_from_file_location("signal_runner", _sr_path)
+sr = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(sr)
 
 try:
     from telegram import Bot
