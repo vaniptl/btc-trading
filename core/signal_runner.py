@@ -825,58 +825,31 @@ def get_signal():
 # ══════════════════════════════════════════════════════════════════
 
 def log_signal_to_sheets(signal: dict):
-    """
-    Appends one signal row to the "Signals" worksheet in Google Sheets.
-    Called every hour by cron/hourly_signal.py.
-
-    Required GitHub Secrets:
-        GOOGLE_SHEET_ID    — spreadsheet ID from the URL
-        GOOGLE_CREDENTIALS — full service-account JSON as a string
-
-    Behaviour when secrets are missing or libraries not installed:
-        Prints a warning and returns silently — cron never crashes.
-    """
     sheet_id   = os.environ.get("GOOGLE_SHEET_ID", "")
     creds_json = os.environ.get("GOOGLE_CREDENTIALS", "")
-
     if not sheet_id or not creds_json:
-        print("⚠️  log_signal_to_sheets: GOOGLE_SHEET_ID or GOOGLE_CREDENTIALS "
-              "not set — skipping Sheets logging.")
+        print("⚠️  log_signal_to_sheets: secrets not set — skipping.")
         return
-
     try:
         import gspread
         from google.oauth2.service_account import Credentials
-
-        scopes     = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds_dict = json.loads(creds_json)
-        creds      = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        gc         = gspread.authorize(creds)
-        sh         = gc.open_by_key(sheet_id)
-
+        scopes = ["https://www.googleapis.com/auth/spreadsheets",
+                  "https://www.googleapis.com/auth/drive"]
+        creds  = Credentials.from_service_account_info(
+                     json.loads(creds_json), scopes=scopes)
+        gc     = gspread.authorize(creds)
+        sh     = gc.open_by_key(sheet_id)
         try:
             ws = sh.worksheet("Signals")
         except Exception:
             ws = sh.add_worksheet(title="Signals", rows=10000, cols=25)
-            ws.append_row([
-                "Timestamp", "Direction", "Price",
-                "Long Score", "Short Score",
-                "Trend L", "Trend S",
-                "Zone L", "Zone S",
-                "Mom L", "Mom S",
-                "Pos L", "Pos S",
-                "RSI", "RSI Zone", "Vol Ratio",
-                "Entry", "Stop Loss", "Take Profit",
-                "Reasons Long", "Reasons Short",
-            ])
-
+            ws.append_row(["Timestamp","Direction","Price","Long Score","Short Score",
+                           "Trend L","Trend S","Zone L","Zone S","Mom L","Mom S",
+                           "Pos L","Pos S","RSI","RSI Zone","Vol Ratio",
+                           "Entry","Stop Loss","Take Profit","Reasons Long","Reasons Short"])
         cats = signal.get("categories", {})
         inds = signal.get("indicators", {})
         ep   = signal.get("entry_plan") or {}
-
         ws.append_row([
             signal.get("timestamp", datetime.utcnow().isoformat()),
             signal.get("direction", "NONE"),
@@ -900,8 +873,11 @@ def log_signal_to_sheets(signal: dict):
             ", ".join(signal.get("reasons_long",  [])),
             ", ".join(signal.get("reasons_short", [])),
         ], value_input_option="USER_ENTERED")
-
         print(f"✅ Sheets logged — {signal.get('direction')} @ ${signal.get('price')}")
+    except ImportError:
+        print("⚠️  gspread not installed — add 'gspread google-auth' to requirements.txt")
+    except Exception as e:
+        print(f"⚠️  log_signal_to_sheets error (non-fatal): {e}")
 
     except ImportError:
         print("⚠️  log_signal_to_sheets: gspread not installed. "
