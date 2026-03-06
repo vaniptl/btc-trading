@@ -259,7 +259,6 @@ def _atr(df, p=14):
 # ══════════════════════════════════════════════════════════════════
 
 def find_sr_levels(df_tf, swing=5, label="1H"):
-    """Returns nearest support/resistance and full level list for a timeframe."""
     if df_tf is None or df_tf.empty:
         return {"levels": [], "nearest_support": None, "nearest_resistance": None, "label": label}
 
@@ -288,15 +287,14 @@ def find_sr_levels(df_tf, swing=5, label="1H"):
     levels += [{"price": v, "type": "resistance", "timeframe": label} for v in resistances[:5]]
 
     return {
-        "levels":            levels,
-        "nearest_support":   supports[-1]    if supports    else None,
-        "nearest_resistance": resistances[0] if resistances else None,
-        "label":             label,
+        "levels":             levels,
+        "nearest_support":    supports[-1]    if supports    else None,
+        "nearest_resistance": resistances[0]  if resistances else None,
+        "label":              label,
     }
 
 
 def compute_fibonacci(df_tf, lookback=100, label="1H"):
-    """Returns fib 0.382, 0.5, 0.618 with actual price values."""
     if df_tf is None or df_tf.empty:
         return {"label": label, "fib382": 0, "fib50": 0, "fib618": 0,
                 "anchor_high": 0, "anchor_low": 0, "trend": "unknown"}
@@ -329,7 +327,6 @@ def compute_fibonacci(df_tf, lookback=100, label="1H"):
 def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
     df = df_1h.copy()
 
-    # ── EMAs (8, 21, 50, 55, 200) ────────────────────────────────
     df["ema8"]   = _ema(df["close"], 8)
     df["ema21"]  = _ema(df["close"], 21)
     df["ema50"]  = _ema(df["close"], 50)
@@ -342,15 +339,12 @@ def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
     df["golden_cross"]    = (df["ema50"] > df["ema200"]) & (df["ema50"].shift(1) <= df["ema200"].shift(1))
     df["death_cross"]     = (df["ema50"] < df["ema200"]) & (df["ema50"].shift(1) >= df["ema200"].shift(1))
 
-    # ── VWAP ─────────────────────────────────────────────────────
     tp         = (df["high"] + df["low"] + df["close"]) / 3
     df["vwap"] = (tp * df["volume"]).cumsum() / df["volume"].cumsum()
 
-    # ── CVD ──────────────────────────────────────────────────────
     hl         = (df["high"] - df["low"]).replace(0, np.nan)
     df["cvd"]  = (df["volume"] * ((df["close"]-df["low"])/hl - (df["high"]-df["close"])/hl)).cumsum()
 
-    # ── CVD divergence (absorption) ──────────────────────────────
     cvd_v  = df["cvd"].values
     c_vals = df["close"].values
     cvd_bull, cvd_bear = [False]*len(df), [False]*len(df)
@@ -365,7 +359,6 @@ def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
     df["cvd_bull_div"] = cvd_bull
     df["cvd_bear_div"] = cvd_bear
 
-    # ── Real buying pressure ──────────────────────────────────────
     vol_ma             = df["volume"].rolling(20).mean()
     vol_std            = df["volume"].rolling(20).std()
     df["vol_confirm"]  = df["volume"] > vol_ma
@@ -378,7 +371,6 @@ def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
     df["real_buying"]  = cvd_rising  & price_up   & df["vol_confirm"]
     df["real_selling"] = cvd_falling & price_down & df["vol_confirm"]
 
-    # ── S/R (1H) ─────────────────────────────────────────────────
     h_v, l_v = df["high"].values, df["low"].values
     cur = float(df["close"].iloc[-1])
     s, ph, pl = 3, [], []
@@ -392,7 +384,6 @@ def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
     for lvl in [v for v in ph if v > cur]:
         df["near_resistance"] |= (df["close"]-lvl).abs()/lvl < 0.005
 
-    # ── Fibonacci (0.382, 0.5, 0.618) ────────────────────────────
     r100  = df.tail(100)
     sh    = float(r100["high"].max())
     sl    = float(r100["low"].min())
@@ -410,7 +401,6 @@ def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
     df.attrs["fib_high"]     = round(sh, 2)
     df.attrs["fib_low"]      = round(sl, 2)
 
-    # ── Order blocks ─────────────────────────────────────────────
     opens, closes = df["open"].values, df["close"].values
     atr_v  = _atr(df).values
     df["in_bullish_ob"] = pd.Series(False, index=df.index)
@@ -426,7 +416,6 @@ def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
             df["in_bearish_ob"] |= ((df["close"] >= min(opens[i],closes[i])) &
                                     (df["close"] <= max(opens[i],closes[i])))
 
-    # ── RSI — regular + hidden divergence ────────────────────────
     rsi_v  = df["rsi"].values
     rsi_bull, rsi_bear = [False]*len(df), [False]*len(df)
     rsi_hbull, rsi_hbear = [False]*len(df), [False]*len(df)
@@ -447,13 +436,11 @@ def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
     df["rsi_hidden_bull_div"] = rsi_hbull
     df["rsi_hidden_bear_div"] = rsi_hbear
 
-    # RSI trend-zone (per TECHNICALS.docx)
     is_up  = df["close"] > df["ema200"]
     is_dn  = df["close"] < df["ema200"]
     df["rsi_trend_bull_zone"] = is_up & (df["rsi"] >= 30) & (df["rsi"] <= 50)
     df["rsi_trend_bear_zone"] = is_dn & (df["rsi"] >= 50) & (df["rsi"] <= 70)
 
-    # ── Market structure (BOS / CHoCH) ───────────────────────────
     bos_up, bos_dn, choch = [False]*len(df), [False]*len(df), [False]*len(df)
     trend = "neutral"
     h_v2, l_v2 = df["high"].values, df["low"].values
@@ -470,7 +457,6 @@ def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
     df["bos_down"] = bos_dn
     df["choch"]    = choch
 
-    # ── 4H Bias ──────────────────────────────────────────────────
     if not df_4h.empty:
         e4     = _ema(df_4h["close"], 21)
         e4_200 = _ema(df_4h["close"], 200)
@@ -481,7 +467,6 @@ def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
         df["bias_bullish_4h"] = False
         df["bias_bearish_4h"] = False
 
-    # ── Liquidations ─────────────────────────────────────────────
     df["major_long_liq"]  = False
     df["major_short_liq"] = False
     if not liq_df.empty and "long_liq_usd" in liq_df.columns:
@@ -491,7 +476,6 @@ def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
         df["major_long_liq"]  = (lh["long_liq_usd"]  > lt_thr).reindex(df.index, fill_value=False)
         df["major_short_liq"] = (lh["short_liq_usd"] > st_thr).reindex(df.index, fill_value=False)
 
-    # ── Funding ──────────────────────────────────────────────────
     df["funding_extreme_long"]  = False
     df["funding_extreme_short"] = False
     if not fund_df.empty:
@@ -499,7 +483,6 @@ def compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df, df_1d=None):
         df["funding_extreme_long"]  = fr >  0.0005
         df["funding_extreme_short"] = fr < -0.0001
 
-    # ── OI ───────────────────────────────────────────────────────
     df["oi_confirm_long"]  = False
     df["oi_confirm_short"] = False
     if not oi_df.empty:
@@ -525,7 +508,6 @@ def compute_scores(df, w=None, min_score=None, min_cats=None,
 
     z = pd.Series(0.0, index=df.index)
 
-    # Trend
     tl  = z.copy(); ts = z.copy()
     tl += df["bias_bullish_4h"].astype(float)                              * w["4h_bias"]
     ts += df["bias_bearish_4h"].astype(float)                              * w["4h_bias"]
@@ -540,7 +522,6 @@ def compute_scores(df, w=None, min_score=None, min_cats=None,
     tl += df["bos_up"].astype(float)                                       * w["bos"]
     ts += df["bos_down"].astype(float)                                     * w["bos"]
 
-    # Zone
     zl  = z.copy(); zs = z.copy()
     zl += df["near_support"].astype(float)                                 * w["support_resistance"]
     zs += df["near_resistance"].astype(float)                              * w["support_resistance"]
@@ -555,7 +536,6 @@ def compute_scores(df, w=None, min_score=None, min_cats=None,
     zl += (df["close"] < df["vwap"]).astype(float)                         * w["vwap"]
     zs += (df["close"] > df["vwap"]).astype(float)                         * w["vwap"]
 
-    # Momentum
     ml  = z.copy(); ms = z.copy()
     ml += (df["rsi"] < 40).astype(float)                                   * w["rsi"]
     ms += (df["rsi"] > 60).astype(float)                                   * w["rsi"]
@@ -576,7 +556,6 @@ def compute_scores(df, w=None, min_score=None, min_cats=None,
     ml += df["vol_confirm"].astype(float)                                  * w["volume"]
     ms += df["vol_confirm"].astype(float)                                  * w["volume"]
 
-    # Positioning
     pl  = z.copy(); ps = z.copy()
     pl += df["choch"].astype(float)                                        * w["choch"]
     ps += df["choch"].astype(float)                                        * w["choch"]
@@ -613,7 +592,6 @@ def compute_scores(df, w=None, min_score=None, min_cats=None,
 
 def get_signal():
     try:
-        # Live price
         try:
             rp = requests.get("https://api.binance.com/api/v3/ticker/price",
                               params={"symbol": "BTCUSDT"}, timeout=5)
@@ -646,35 +624,30 @@ def get_signal():
 
         direction = "LONG" if lsig else ("SHORT" if ssig else "NONE")
 
-        # S/R for all timeframes
         sr_1h = find_sr_levels(df_1h, swing=5, label="1H")
         sr_4h = find_sr_levels(df_4h, swing=3, label="4H")
         sr_1d = find_sr_levels(df_1d, swing=3, label="1D") if not df_1d.empty else {}
 
-        # Fibonacci for all timeframes
         fib_1h = compute_fibonacci(df_1h, lookback=100, label="1H")
         fib_4h = compute_fibonacci(df_4h, lookback=60,  label="4H")
         fib_1d = compute_fibonacci(df_1d, lookback=30,  label="1D") if not df_1d.empty else {}
 
-        # Entry plan
         entry_plan = None
-        if lsig or ssig:
-            if lsig:
-                entry_plan = {
-                    "entry":       round(price, 2),
-                    "stop_loss":   round(price - atr * ATR_SL, 2),
-                    "take_profit": round(price + atr * ATR_TP, 2),
-                    "rr":          round(ATR_TP / ATR_SL, 1),
-                }
-            else:
-                entry_plan = {
-                    "entry":       round(price, 2),
-                    "stop_loss":   round(price + atr * ATR_SL, 2),
-                    "take_profit": round(price - atr * ATR_TP, 2),
-                    "rr":          round(ATR_TP / ATR_SL, 1),
-                }
+        if lsig:
+            entry_plan = {
+                "entry":       round(price, 2),
+                "stop_loss":   round(price - atr * ATR_SL, 2),
+                "take_profit": round(price + atr * ATR_TP, 2),
+                "rr":          round(ATR_TP / ATR_SL, 1),
+            }
+        elif ssig:
+            entry_plan = {
+                "entry":       round(price, 2),
+                "stop_loss":   round(price + atr * ATR_SL, 2),
+                "take_profit": round(price - atr * ATR_TP, 2),
+                "rr":          round(ATR_TP / ATR_SL, 1),
+            }
 
-        # Build reasons
         ema50_v  = float(row["ema50"])
         ema200_v = float(row["ema200"])
         is_up    = price > ema200_v
@@ -727,7 +700,6 @@ def get_signal():
                 if is_long_ind:  reasons_long.append(name)
                 if is_short_ind: reasons_short.append(name)
 
-        # RSI zone label
         rsi_v = float(row["rsi"])
         if is_up and 30 <= rsi_v <= 50:
             rsi_zone = "Bull Buy Zone (30-50)"
@@ -758,13 +730,13 @@ def get_signal():
                 "positioning": {"long": round(float(row["pos_l"]),2),   "short": round(float(row["pos_s"]),2)},
             },
             "indicators": {
-                "rsi":       round(rsi_v, 1),
-                "rsi_zone":  rsi_zone,
-                "atr":       round(atr, 0),
-                "vol_ratio": round(float(row.get("vol_ratio", 1)), 2),
-                "vwap":      round(float(row.get("vwap", 0)), 2),
-                "ema50":     round(ema50_v, 2),
-                "ema200":    round(ema200_v, 2),
+                "rsi":          round(rsi_v, 1),
+                "rsi_zone":     rsi_zone,
+                "atr":          round(atr, 0),
+                "vol_ratio":    round(float(row.get("vol_ratio", 1)), 2),
+                "vwap":         round(float(row.get("vwap", 0)), 2),
+                "ema50":        round(ema50_v, 2),
+                "ema200":       round(ema200_v, 2),
                 "ema200_cross": "Golden" if ema50_v > ema200_v else "Death",
                 "real_buying":  bool(row.get("real_buying")),
                 "real_selling": bool(row.get("real_selling")),
@@ -788,15 +760,104 @@ def get_signal():
 
 
 # ══════════════════════════════════════════════════════════════════
+# GOOGLE SHEETS LOGGING
+# ══════════════════════════════════════════════════════════════════
+
+def log_signal_to_sheets(signal: dict):
+    """
+    Appends the current signal to a Google Sheet via the Sheets API.
+
+    Required GitHub Secrets / env vars:
+        GOOGLE_SHEET_ID       — the spreadsheet ID from the URL
+        GOOGLE_CREDENTIALS    — service account JSON (as a string)
+
+    Sheet columns (auto-created on first write):
+        Timestamp | Direction | Price | Long Score | Short Score |
+        Trend L | Trend S | Zone L | Zone S | Mom L | Mom S |
+        Pos L | Pos S | RSI | RSI Zone | Vol Ratio | Entry |
+        Stop Loss | Take Profit | Reasons Long | Reasons Short
+    """
+    sheet_id    = os.environ.get("GOOGLE_SHEET_ID", "")
+    creds_json  = os.environ.get("GOOGLE_CREDENTIALS", "")
+
+    # ── If secrets not set, log a warning and skip gracefully ────
+    if not sheet_id or not creds_json:
+        print("⚠️  log_signal_to_sheets: GOOGLE_SHEET_ID or GOOGLE_CREDENTIALS "
+              "not set — skipping Sheets logging.")
+        return
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds_dict = json.loads(creds_json)
+        creds      = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc         = gspread.authorize(creds)
+        sh         = gc.open_by_key(sheet_id)
+
+        # Use first sheet, or create "Signals" tab if missing
+        try:
+            ws = sh.worksheet("Signals")
+        except Exception:
+            ws = sh.add_worksheet(title="Signals", rows=10000, cols=25)
+            # Write header row
+            ws.append_row([
+                "Timestamp", "Direction", "Price",
+                "Long Score", "Short Score",
+                "Trend L", "Trend S", "Zone L", "Zone S",
+                "Mom L", "Mom S", "Pos L", "Pos S",
+                "RSI", "RSI Zone", "Vol Ratio",
+                "Entry", "Stop Loss", "Take Profit",
+                "Reasons Long", "Reasons Short",
+            ])
+
+        cats  = signal.get("categories", {})
+        inds  = signal.get("indicators", {})
+        ep    = signal.get("entry_plan") or {}
+
+        row = [
+            signal.get("timestamp", datetime.utcnow().isoformat()),
+            signal.get("direction", "NONE"),
+            signal.get("price", 0),
+            signal.get("long_score", 0),
+            signal.get("short_score", 0),
+            cats.get("trend",       {}).get("long",  0),
+            cats.get("trend",       {}).get("short", 0),
+            cats.get("zone",        {}).get("long",  0),
+            cats.get("zone",        {}).get("short", 0),
+            cats.get("momentum",    {}).get("long",  0),
+            cats.get("momentum",    {}).get("short", 0),
+            cats.get("positioning", {}).get("long",  0),
+            cats.get("positioning", {}).get("short", 0),
+            inds.get("rsi",       0),
+            inds.get("rsi_zone",  ""),
+            inds.get("vol_ratio", 0),
+            ep.get("entry",       ""),
+            ep.get("stop_loss",   ""),
+            ep.get("take_profit", ""),
+            ", ".join(signal.get("reasons_long",  [])),
+            ", ".join(signal.get("reasons_short", [])),
+        ]
+
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        print(f"✅ Signal logged to Google Sheets — {signal.get('direction')} @ ${signal.get('price')}")
+
+    except ImportError:
+        print("⚠️  log_signal_to_sheets: 'gspread' not installed. "
+              "Add 'gspread google-auth' to requirements.txt")
+    except Exception as e:
+        print(f"⚠️  log_signal_to_sheets error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════
 # DAILY TRADE HISTORY
 # ══════════════════════════════════════════════════════════════════
 
 def build_daily_trade_history(pf, init_cash=None):
-    """
-    Robust trade history builder — handles any vectorbt version.
-    Inspects actual column names at runtime instead of assuming them.
-    Returns: (summary, trades_df, daily_df, weekly_df, monthly_df)
-    """
     if init_cash is None:
         init_cash = INIT_CASH
 
@@ -810,19 +871,16 @@ def build_daily_trade_history(pf, init_cash=None):
     if raw.empty:
         return empty
 
-    # Normalise column names: lowercase + replace spaces with underscores
     raw.columns = [c.lower().strip().replace(" ", "_") for c in raw.columns]
     cols = set(raw.columns)
 
     def fc(*candidates):
-        """Return first column name that exists, else None."""
         for c in candidates:
             if c in cols:
                 return c
         return None
 
     def get_col(col_name, default=None):
-        """Safely get a column by name, return default Series if missing."""
         if col_name and col_name in cols:
             return raw[col_name]
         n = len(raw)
@@ -830,7 +888,6 @@ def build_daily_trade_history(pf, init_cash=None):
             return pd.Series([np.nan] * n, index=raw.index)
         return pd.Series([default] * n, index=raw.index)
 
-    # ── Detect all possible column name variants ──────────────────
     entry_time_col  = fc("entry_time",  "entry_idx",  "open_idx",   "open_time",  "start_time")
     exit_time_col   = fc("exit_time",   "exit_idx",   "close_idx",  "close_time", "end_time")
     entry_price_col = fc("entry_price", "avg_entry_price", "open_price",  "entry_bar_close")
@@ -840,9 +897,7 @@ def build_daily_trade_history(pf, init_cash=None):
     exit_type_col   = fc("exit_type", "close_reason", "exit_reason", "status", "close_type")
     ret_col         = fc("return", "return_(%)", "pnl_pct", "return_pct", "ret", "pct_return")
 
-    # ── Build clean DataFrame ─────────────────────────────────────
     td = pd.DataFrame(index=raw.index)
-
     td["entry_time"]  = pd.to_datetime(get_col(entry_time_col), errors="coerce")
     td["exit_time"]   = pd.to_datetime(get_col(exit_time_col),  errors="coerce")
     td["direction"]   = get_col(dir_col, "Long").astype(str).str.upper()
@@ -851,10 +906,8 @@ def build_daily_trade_history(pf, init_cash=None):
     td["pnl"]         = pd.to_numeric(get_col(pnl_col, 0),      errors="coerce").fillna(0)
     td["exit_reason"] = get_col(exit_type_col, "Unknown").astype(str)
 
-    # PnL % — vbt sometimes stores as decimal (0.05) or percent (5.0)
     if ret_col:
         raw_ret = pd.to_numeric(raw[ret_col], errors="coerce")
-        # If median absolute value < 5, assume decimal → multiply by 100
         td["pnl_pct"] = raw_ret * 100 if raw_ret.abs().median() < 5 else raw_ret
     else:
         td["pnl_pct"] = td["pnl"] / init_cash * 100
@@ -865,7 +918,6 @@ def build_daily_trade_history(pf, init_cash=None):
     td = td.sort_values("exit_time").reset_index(drop=True)
     td["balance"]    = init_cash + td["pnl"].cumsum()
 
-    # ── Daily summary ─────────────────────────────────────────────
     daily = td.groupby("exit_date").agg(
         trades   =("pnl", "count"),
         wins     =("win", "sum"),
@@ -877,7 +929,6 @@ def build_daily_trade_history(pf, init_cash=None):
     daily["cum_pnl"]     = daily["net_pnl"].cumsum()
     daily["balance_eod"] = init_cash + daily["cum_pnl"]
 
-    # ── Weekly rollup ─────────────────────────────────────────────
     td["exit_week"] = td["exit_time"].dt.to_period("W")
     weekly = td.groupby("exit_week").agg(
         trades  =("pnl", "count"),
@@ -888,7 +939,6 @@ def build_daily_trade_history(pf, init_cash=None):
     weekly["cum_pnl"]  = weekly["net_pnl"].cumsum()
     weekly["week_str"] = weekly["exit_week"].astype(str)
 
-    # ── Monthly rollup ────────────────────────────────────────────
     td["exit_month"] = td["exit_time"].dt.to_period("M")
     monthly = td.groupby("exit_month").agg(
         trades  =("pnl", "count"),
