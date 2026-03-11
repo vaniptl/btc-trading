@@ -66,14 +66,33 @@ def format_signal_message(sig: dict) -> str:
     elif d == "SHORT": icon = "🔴"; rl = sig["reasons_short"]
     else:              icon = "⚪"; rl = []
 
-    ep   = sig.get("entry_plan")
-    inds = sig.get("indicators", {})
-    ts   = sig["timestamp"][:16].replace("T"," ")
+    ep    = sig.get("entry_plan")
+    inds  = sig.get("indicators", {})
+    ts_   = sig["timestamp"][:16].replace("T"," ")
+
+    # Regime info (v8.5)
+    regime = sig.get("regime", "")
+    rcfg   = sig.get("regime_config", {})
+    regime_emoji = rcfg.get("emoji", "")
+    vp     = sig.get("volume_profile", {})
+    h1_str = sig.get("h1_structure", "")
+    h4_str = sig.get("h4_structure", "")
+    bear_ov= sig.get("bear_override", "NONE")
 
     lines = [
         f"{icon} *BTC/USD SIGNAL — {d}*",
-        f"🕐 `{ts} UTC`",
+        f"🕐 `{ts_} UTC`",
         f"💲 Price: `${p:,.2f}`",
+        f"",
+        f"{regime_emoji} *Regime: {regime}*",
+        f"  {rcfg.get('description','')}",
+        f"  SL: `{rcfg.get('atr_sl_mult','?')}x ATR` \\| TP: `{rcfg.get('atr_tp_mult','?')}x ATR`",
+        f"  4H: `{h4_str}` \\| 1H: `{h1_str}`",
+    ]
+    if bear_ov != "NONE":
+        lines.append(f"  ⚡ Bear Override: `{bear_ov}`")
+
+    lines += [
         f"",
         f"📊 *Scores*",
         f"  Long:  `{ls:5.2f}` `{score_bar(ls)}`",
@@ -85,16 +104,23 @@ def format_signal_message(sig: dict) -> str:
         f"  ⚡ Momentum   L:`{cats['momentum']['long']:4.1f}`  S:`{cats['momentum']['short']:4.1f}`",
         f"  🎯 Positioning L:`{cats['positioning']['long']:4.1f}`  S:`{cats['positioning']['short']:4.1f}`",
         f"",
+        f"📦 *Volume Profile*",
+        f"  POC: `${vp.get('poc',0):,.0f}` \\| VAH: `${vp.get('vah',0):,.0f}` \\| VAL: `${vp.get('val',0):,.0f}`",
+        f"  Above VAH: `{'✅ YES' if inds.get('above_vah') else '❌ NO'}`",
+        f"",
         f"🔬 *Indicators*",
-        f"  RSI: `{inds.get('rsi',0):.1f}` | Vol Ratio: `{inds.get('vol_ratio',0):.2f}x`",
-        f"  EMA200: `${inds.get('ema200',0):,.0f}` | VWAP: `${inds.get('vwap',0):,.0f}`",
-        f"  ATR: `${inds.get('atr',0):,.0f}`",
+        f"  RSI: `{inds.get('rsi',0):.1f}` \\| MFI: `{inds.get('mfi',0):.1f}` \\| Stoch: `{inds.get('stoch_k',0):.1f}`",
+        f"  EMA50: `${inds.get('ema50',0):,.0f}` \\| EMA200: `${inds.get('ema200',0):,.0f}`",
+        f"  ATR: `${inds.get('atr',0):,.0f}` \\| Vol: `{inds.get('vol_ratio',0):.2f}x`",
+        f"  Bull Flag: `{'🚩 YES' if inds.get('bull_flag') else 'No'}` \\| Real Buying: `{'✅' if inds.get('real_buying') else 'No'}`",
     ]
 
     if rl:
-        lines += [f"", f"✅ *Active Reasons ({len(rl)})*"]
-        for r in rl:
+        lines += [f"", f"✅ *Active Reasons \\({len(rl)}\\)*"]
+        for r in rl[:8]:   # cap at 8 to avoid Telegram message limit
             lines.append(f"  • {r}")
+        if len(rl) > 8:
+            lines.append(f"  \\.\\.\\. and {len(rl)-8} more")
 
     if ep:
         lines += [
@@ -112,9 +138,13 @@ def format_backtest_message(result: dict) -> str:
     if not result: return "❌ Backtest failed — check logs"
     ret_icon = "🟢" if result["total_return"] > 0 else "🔴"
     bh_icon  = "✅" if result.get("beat_bh") else "❌"
+    regime   = result.get("regime", "UNKNOWN")
+    tf       = result.get("timeframe", "1H")
+    em_map   = {"STRONG_BULL":"🚀","WEAK_BULL":"📈","BEAR":"🐻","RANGING":"↔️","UNKNOWN":"❓"}
     lines = [
-        f"📊 *Backtest Result — {result['period']}*",
+        f"📊 *Backtest Result — {result['period']} \\| {tf}*",
         f"📅 {result['start']} → {result['end']}",
+        f"{em_map.get(regime,'❓')} Regime: `{regime}`",
         f"",
         f"{ret_icon} Return:        `{result['total_return']:>8.2%}`",
         f"{bh_icon} Beat Buy&Hold: `{result.get('beat_bh', False)}`  \\(B&H: {result.get('buy_and_hold',0):.1%}\\)",
@@ -127,7 +157,7 @@ def format_backtest_message(result: dict) -> str:
         f"💸 Avg Loss:      `${result['avg_loss']:>9,.2f}`",
         f"🏦 Final Value:   `${result['final_value']:>9,.2f}`",
         f"",
-        f"💾 Saved to memory \\(run #{result.get('run_num',1)}\\)",
+        f"💾 Saved to memory \\(run \\#{result.get('run_num',1)}\\)",
     ]
     return "\n".join(lines)
 
@@ -209,16 +239,26 @@ def _run_backtest_sync(period: str):
         return {"error": "vectorbt not installed"}
 
     days = sr.PERIOD_DAYS[period]
-    df_1h  = sr.fetch_ohlcv("hour", 1,  days_back=days)
-    df_4h  = sr.fetch_ohlcv("hour", 4,  days_back=days)
+    # v8.5: fetch with warmup buffers
+    df_1h  = sr.fetch_ohlcv("hour", 1, days_back=days+30)
+    df_4h  = sr.fetch_ohlcv("hour", 4, days_back=days+60)
+    df_1d  = sr.fetch_ohlcv("day",  1, days_back=days+250)
     liq_df = sr.fetch_liquidations(max_days=min(days,30))
     fund_df= sr.fetch_funding()
     oi_df  = sr.fetch_oi()
 
     if df_1h.empty: return {"error": "No OHLCV data"}
 
-    df = sr.compute_indicators(df_1h, df_4h, liq_df, fund_df, oi_df)
-    df = sr.compute_scores(df)
+    import pandas as pd
+    from datetime import datetime as dt2, timezone as tz2, timedelta as td2
+    df = sr.compute_indicators(df_1h, df_4h, df_1d, liq_df, fund_df, oi_df)
+    regime, _ = sr.detect_regime(df, df_4h_ext=df_4h, df_1d_ext=df_1d)
+    h4_str = sr.detect_local_structure(df_4h, lookback_bars=30, tf_label="4H") if not df_4h.empty else "ranging"
+    h1_str = sr.detect_local_structure(df,    lookback_bars=48, tf_label="1H")
+    df     = sr.compute_scores_regime(df, regime, sr.MIN_CATS, sr.TREND_REQ,
+                                      h1_structure=h1_str, h4_structure=h4_str)
+    cutoff_ts = pd.Timestamp(dt2.now(tz2.utc) - td2(days=days)).tz_localize(None)
+    df = df[df.index >= cutoff_ts].copy()
 
     n_long  = int(df["long_signal"].sum())
     n_short = int(df["short_signal"].sum())
@@ -250,9 +290,11 @@ def _run_backtest_sync(period: str):
     bh = float(df["close"].iloc[-1]/df["close"].iloc[0])-1
 
     result = {
-        "run_id":        dt.utcnow().strftime("%Y%m%d_%H%M%S"),
+        "run_id":        dt.utcnow().strftime("%Y%m%d_%H%M%S") + f"_{period}_1H",
         "run_ts":        dt.utcnow().isoformat(),
         "period":        period,
+        "timeframe":     "1H",
+        "regime":        regime,
         "start":         str(df.index[0].date()),
         "end":           str(df.index[-1].date()),
         "total_return":  round(float(pf.total_return()),4),
