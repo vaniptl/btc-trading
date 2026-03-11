@@ -113,7 +113,7 @@ with tab_signal:
     with col1:
         st.markdown("### Live Signal")
     with col2:
-        refresh = st.button("🔄 Refresh", use_container_width=True)
+        refresh = st.button("🔄 Refresh", width='stretch')
 
     # Auto-fetch if stale (>60s) or manual refresh
     now = time.time()
@@ -194,7 +194,7 @@ with tab_signal:
             "Long":  [cats["trend"]["long"], cats["zone"]["long"], cats["momentum"]["long"], cats["positioning"]["long"]],
             "Short": [cats["trend"]["short"],cats["zone"]["short"],cats["momentum"]["short"],cats["positioning"]["short"]],
         }
-        st.dataframe(pd.DataFrame(cat_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(cat_data), width='stretch', hide_index=True)
 
         # ── Active reasons ───────────────────────────────────────
         active_reasons = sig.get("reasons_long" if d=="LONG" else "reasons_short", [])
@@ -214,7 +214,7 @@ with tab_signal:
                 ("Above EMA50",       "Above EMA50" in rl_,        False),
                 ("Above EMA200",      price > inds.get("ema200",0), False),
                 ("Above VAH",         inds.get("above_vah",False),  not inds.get("above_vah",True)),
-                ("Near POC",          df_chart is not None and bool(df_chart.iloc[-1].get("near_poc",False)) if df_chart is not None else False, False),
+                ("Near POC",          "Near POC" in rl_+rs_, False),
                 ("Near Support",      "Near Support" in rl_,       False),
                 ("Near Resistance",   False,                        "Near Resistance" in rs_),
                 ("Fib 0.618",         "Fib 0.618" in rl_+rs_,      False),
@@ -263,12 +263,12 @@ with tab_signal:
                     "EMA55":  tail["ema55"],
                     "EMA200": tail["ema200"],
                 })
-                st.line_chart(chart_data, use_container_width=True)
+                st.line_chart(chart_data, width='stretch')
 
                 # RSI
                 rsi_data = pd.DataFrame({"RSI": tail["rsi"]})
                 st.markdown("**RSI**")
-                st.line_chart(rsi_data, use_container_width=True, height=120)
+                st.line_chart(rsi_data, width='stretch', height=120)
 
     elif sig and "error" in sig:
         st.error(f"Error: {sig['error']}")
@@ -294,7 +294,7 @@ with tab_backtest:
     atr_sl    = c2.number_input("ATR SL Mult",  value=float(sr.ATR_SL),      step=0.5, min_value=0.5, max_value=5.0)
     atr_tp    = c3.number_input("ATR TP Mult",  value=float(sr.ATR_TP),      step=0.5, min_value=1.0, max_value=10.0)
 
-    run_btn = st.button("🚀 Run Backtest", use_container_width=True, type="primary")
+    run_btn = st.button("🚀 Run Backtest", width='stretch', type="primary")
 
     if run_btn:
         try:
@@ -423,7 +423,7 @@ with tab_backtest:
             st.markdown("**Equity Curve**")
             eq = r["equity"].reset_index()
             eq.columns = ["Date", "Portfolio Value"]
-            st.line_chart(eq.set_index("Date"), use_container_width=True)
+            st.line_chart(eq.set_index("Date"), width='stretch')
 
         # Trade log
         if "trades_df" in r and not r["trades_df"].empty:
@@ -432,7 +432,7 @@ with tab_backtest:
                                              "Exit Timestamp","Exit Price","PnL","Return"]
                                 if c in r["trades_df"].columns]
                 st.dataframe(r["trades_df"][display_cols] if display_cols else r["trades_df"],
-                             use_container_width=True)
+                             width='stretch')
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -463,7 +463,7 @@ with tab_history:
                 "Beat B&H":    "✅" if r.get("beat_bh") else "❌",
                 "min_score":   r.get("config",{}).get("min_score",""),
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
         # Download memory as JSON
         st.download_button(
@@ -517,7 +517,7 @@ with tab_learn:
             {"Period": p, "Avg Sharpe": round(sum(v)/len(v),3), "Runs": len(v)}
             for p, v in by_period.items()
         ]).sort_values("Avg Sharpe", ascending=False)
-        st.dataframe(period_df, use_container_width=True, hide_index=True)
+        st.dataframe(period_df, width='stretch', hide_index=True)
 
         # Min score sensitivity
         scores_tested = list(set(r["config"].get("min_score","") for r in mem if "config" in r))
@@ -534,7 +534,7 @@ with tab_learn:
                         "Runs":        len(runs),
                     })
             if score_rows:
-                st.dataframe(pd.DataFrame(score_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(score_rows), width='stretch', hide_index=True)
 
         # Regime breakdown in learn tab
         by_regime = {}
@@ -554,7 +554,7 @@ with tab_learn:
                     "Avg Sharpe":f"{sum(r['sharpe_ratio'] for r in runs)/len(runs):.3f}",
                     "Win Rate":  f"{sum(r['win_rate'] for r in runs)/len(runs):.1%}",
                 })
-            st.dataframe(pd.DataFrame(regime_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(regime_rows), width='stretch', hide_index=True)
 
         # Best config recommendation
         st.markdown("**💡 Recommended Config (from best run)**")
