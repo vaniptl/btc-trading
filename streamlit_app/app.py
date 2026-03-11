@@ -1,6 +1,6 @@
 """
 streamlit_app/app.py — BTC Strategy Mobile Dashboard v8.5
-Regime-Aware · Volume Profile · 1H/1D Timeframe Selector
+Regime-Aware · 5-Signal Voting · Volume Profile · 1H/1D Timeframe Selector
 """
 
 import os, sys, json, time
@@ -42,10 +42,8 @@ st.markdown("""
   .chip-inactive { display:inline-block; background:#2a2a2a; color:#555; border-radius:20px; padding:2px 10px; font-size:0.75em; margin:2px; }
   .chip-bear     { display:inline-block; background:#d50000; color:#fff; border-radius:20px; padding:2px 10px; font-size:0.75em; margin:2px; font-weight:600; }
 
-  .tf-box {
-    border: 2px solid #444; border-radius: 12px; padding: 14px 18px;
-    text-align: center; cursor: pointer; transition: all 0.2s;
-  }
+  .tf-box { border: 2px solid #444; border-radius: 12px; padding: 14px 18px;
+    text-align: center; cursor: pointer; transition: all 0.2s; }
   .tf-box-selected { border-color: #00c853; background: #0a2e14; }
 
   header { visibility: hidden; }
@@ -55,7 +53,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 import signal_runner as sr
-
 
 # ══════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -75,7 +72,6 @@ REGIME_EMOJI = {
     "UNKNOWN":     "❓",
 }
 
-
 # ══════════════════════════════════════════════════════════════════
 # SESSION STATE
 # ══════════════════════════════════════════════════════════════════
@@ -89,7 +85,6 @@ for k, v in [
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
-
 
 # ══════════════════════════════════════════════════════════════════
 # HELPERS
@@ -156,8 +151,8 @@ with tab_signal:
 
         # ── Signal card ───────────────────────────────────────────
         if   d == "LONG":  card_cls = "long-card";  label = "🟢 LONG"
-        elif d == "SHORT": card_cls = "short-card";  label = "🔴 SHORT"
-        else:              card_cls = "none-card";   label = "⚪ NO SIGNAL"
+        elif d == "SHORT": card_cls = "short-card"; label = "🔴 SHORT"
+        else:              card_cls = "none-card";  label = "⚪ NO SIGNAL"
 
         st.markdown(f"""
         <div class="signal-card {card_cls}">
@@ -187,115 +182,91 @@ with tab_signal:
             4H: <b>{h4_str}</b> &nbsp;|&nbsp; 1H: <b>{h1_str}</b>
             &nbsp;|&nbsp; SL: <b>{rcfg_d.get("atr_sl_mult","?")}x ATR</b>
             &nbsp;|&nbsp; TP: <b>{rcfg_d.get("atr_tp_mult","?")}x ATR</b>
-            &nbsp;|&nbsp; Min score L/S:
-            <b>{rcfg_d.get("min_score_long","?")}</b> /
-            <b>{rcfg_d.get("min_score_short","?")}</b>
+            &nbsp;|&nbsp; Min L/S: <b>{rcfg_d.get("min_score_long","?")}</b> / <b>{rcfg_d.get("min_score_short","?")}</b>
           </span>
         </div>
         """, unsafe_allow_html=True)
 
-        if bear_ov != "NONE":
-            st.warning(f"⚡ Bear Structure Override: **{bear_ov}**")
+        if bear_ov and bear_ov != "NONE":
+            st.warning(f"⚡ Bear Override Active: **{bear_ov}**")
 
         # ── Volume Profile ────────────────────────────────────────
-        st.markdown("**📦 Volume Profile**")
-        vc1, vc2, vc3 = st.columns(3)
-        poc_v = vp.get("poc", 0)
-        vah_v = vp.get("vah", 0)
-        val_v = vp.get("val", 0)
-        vc1.metric("POC", f"${poc_v:,.0f}", help="Point of Control — highest volume price")
-        vc2.metric("VAH", f"${vah_v:,.0f}", help="Value Area High — regime level")
-        vc3.metric("VAL", f"${val_v:,.0f}", help="Value Area Low — downside magnet")
-        above_vah = inds.get("above_vah", False)
-        st.markdown(
-            f"**{'🟢 Above VAH — BH Bullish Zone' if above_vah else '🔴 Below VAH — BH Bearish Zone'}**"
-        )
-
-        # ── Scores ────────────────────────────────────────────────
-        st.markdown("**📊 Confluence Scores**")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown(f"🟢 Long: **{ls:.2f}**")
-            st.markdown(pct_bar(ls / 20, "#00c853"), unsafe_allow_html=True)
-        with c2:
-            st.markdown(f"🔴 Short: **{ss:.2f}**")
-            st.markdown(pct_bar(ss / 20, "#d50000"), unsafe_allow_html=True)
-
-        # ── Category breakdown ────────────────────────────────────
-        st.markdown("**Category Breakdown**")
-        cat_data = {
-            "Category": ["📈 Trend", "📍 Zone", "⚡ Momentum", "🎯 Positioning"],
-            "Long":  [cats["trend"]["long"],  cats["zone"]["long"],
-                      cats["momentum"]["long"],  cats["positioning"]["long"]],
-            "Short": [cats["trend"]["short"], cats["zone"]["short"],
-                      cats["momentum"]["short"], cats["positioning"]["short"]],
-        }
-        st.dataframe(pd.DataFrame(cat_data), use_container_width=True, hide_index=True)
-
-        # ── Active reasons ────────────────────────────────────────
-        active_reasons = rl_ if d == "LONG" else rs_
-        if active_reasons:
-            st.markdown(f"**Active Indicators ({len(active_reasons)})**")
-            is_short = d == "SHORT"
-            chips_html = " ".join(chip(r, True, bear=is_short) for r in active_reasons)
-            st.markdown(chips_html, unsafe_allow_html=True)
-
-        # ── All indicator status ──────────────────────────────────
-        with st.expander("🔬 All Indicator Status"):
-            all_inds = [
-                ("4H Bias Bull",    "4H Bias Bullish"  in rl_),
-                ("4H Bias Bear",    "4H Bias Bearish"  in rs_),
-                ("EMA Ribbon Bull", "EMA Ribbon Bull"  in rl_),
-                ("EMA Ribbon Bear", "EMA Ribbon Bear"  in rs_),
-                ("Above EMA50",     price > inds.get("ema50",  0)),
-                ("Above EMA200",    price > inds.get("ema200", 0)),
-                ("Above VAH",       above_vah),
-                ("Near POC",        "Near POC"         in rl_ + rs_),
-                ("Near VAL",        "Near VAL"         in rl_),
-                ("Near VAH",        "Near VAH"         in rs_),
-                ("AVWAP Bull",      "AVWAP Bull"       in rl_),
-                ("Near Support",    "Near Support"     in rl_),
-                ("Near Resistance", "Near Resistance"  in rs_),
-                ("Fib 0.618",       "Fib 0.618"        in rl_ + rs_),
-                ("Fib 0.500",       "Fib 0.500"        in rl_ + rs_),
-                ("Fib 0.382",       "Fib 0.382"        in rl_ + rs_),
-                ("Bullish OB",      "Bullish OB"       in rl_),
-                ("Bearish OB",      "Bearish OB"       in rs_),
-                ("Below VWAP",      price < inds.get("vwap", price + 1)),
-                ("RSI Bull Div",    "RSI Bull Div"     in rl_),
-                ("RSI Bear Div",    "RSI Bear Div"     in rs_),
-                ("RSI Hidden Bull", "RSI Hidden Bull"  in rl_),
-                ("MFI Bull",        "MFI Bull"         in rl_),
-                ("Stoch Bull",      "Stoch Bull"       in rl_),
-                ("Bull Flag",       inds.get("bull_flag",    False)),
-                ("CVD Bull Div",    "CVD Bull Div"     in rl_),
-                ("CVD Bear Div",    "CVD Bear Div"     in rs_),
-                ("Real Buying",     inds.get("real_buying",  False)),
-                ("Real Selling",    inds.get("real_selling", False)),
-                ("Vol Confirm",     inds.get("vol_ratio",    0) > 1),
-                ("Long Liq",        "Long Liq"         in rl_),
-                ("Short Liq",       "Short Liq"        in rs_),
-                ("Funding Short",   "Funding Short"    in rl_),
-                ("OI Long",         "OI Long"          in rl_),
-            ]
-            html = ""
-            for name, active in all_inds:
-                html += chip(name, active) + " "
-            st.markdown(html, unsafe_allow_html=True)
-
-            st.markdown("---")
-            ci1, ci2, ci3, ci4, ci5 = st.columns(5)
-            ci1.metric("RSI",       f"{inds.get('rsi',       0):.1f}")
-            ci2.metric("MFI",       f"{inds.get('mfi',       0):.1f}")
-            ci3.metric("Stoch K",   f"{inds.get('stoch_k',   0):.1f}")
-            ci4.metric("Vol Ratio", f"{inds.get('vol_ratio', 0):.2f}x")
-            ci5.metric("ATR",       f"${inds.get('atr',      0):,.0f}")
+        if vp and vp.get("poc"):
             st.markdown(
-                f"EMA50: **${inds.get('ema50',0):,.0f}** &nbsp;|&nbsp; "
-                f"EMA200: **${inds.get('ema200',0):,.0f}** &nbsp;|&nbsp; "
-                f"VWAP: **${inds.get('vwap',0):,.0f}** &nbsp;|&nbsp; "
-                f"Bull Flag: **{'🚩 YES' if inds.get('bull_flag') else 'No'}**"
+                f"**Volume Profile** &nbsp; POC: `${vp['poc']:,.0f}` &nbsp;|&nbsp; "
+                f"VAH: `${vp['vah']:,.0f}` &nbsp;|&nbsp; VAL: `${vp['val']:,.0f}`"
             )
+
+        # ── Score bars ────────────────────────────────────────────
+        st.markdown("**Score Breakdown**")
+        max_possible = 15.0
+        col_l, col_s = st.columns(2)
+        with col_l:
+            st.caption(f"🟢 Long: {ls:.2f}")
+            st.markdown(pct_bar(ls / max_possible, "#00c853"), unsafe_allow_html=True)
+        with col_s:
+            st.caption(f"🔴 Short: {ss:.2f}")
+            st.markdown(pct_bar(ss / max_possible, "#d50000"), unsafe_allow_html=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Trend L",    f"{cats['trend']['long']:.1f}")
+        c2.metric("Zone L",     f"{cats['zone']['long']:.1f}")
+        c3.metric("Mom L",      f"{cats['momentum']['long']:.1f}")
+        c4.metric("Pos L",      f"{cats['positioning']['long']:.1f}")
+        c1.metric("Trend S",    f"{cats['trend']['short']:.1f}")
+        c2.metric("Zone S",     f"{cats['zone']['short']:.1f}")
+        c3.metric("Mom S",      f"{cats['momentum']['short']:.1f}")
+        c4.metric("Pos S",      f"{cats['positioning']['short']:.1f}")
+
+        # ── Indicator chips ───────────────────────────────────────
+        st.markdown("**Active Indicators**")
+        is_bear_sig = d == "SHORT"
+        all_inds = [
+            ("4H Bull",      "4H Bullish"    in rl_),
+            ("4H Bear",      "4H Bearish"    in rs_),
+            ("EMA Ribbon ↑", "EMA Ribbon Bull" in rl_),
+            ("EMA Ribbon ↓", "EMA Ribbon Bear" in rs_),
+            ("Above EMA200", "Above EMA200"  in rl_),
+            ("Above VAH",    "Above VAH"     in rl_),
+            ("Near POC",     "Near POC"      in rl_ + rs_),
+            ("AVWAP Bull",   "AVWAP Bull"    in rl_),
+            ("Near Support", "Near Support"  in rl_),
+            ("Near Resist",  "Near Resistance" in rs_),
+            ("Fib 0.618",    "Fib 0.618"     in rl_ + rs_),
+            ("Fib 0.500",    "Fib 0.500"     in rl_ + rs_),
+            ("Fib 0.382",    "Fib 0.382"     in rl_ + rs_),
+            ("Bullish OB",   "Bullish OB"    in rl_),
+            ("Bearish OB",   "Bearish OB"    in rs_),
+            ("RSI Bull Div", "RSI Bull Div"  in rl_),
+            ("RSI Hid Bull", "RSI Hidden Bull" in rl_),
+            ("MFI Bull",     "MFI" in " ".join(rl_) and "Bull" in " ".join(rl_)),
+            ("Stoch Bull",   "Stoch" in " ".join(rl_)),
+            ("Bull Flag",    inds.get("bull_flag",    False)),
+            ("CVD Bull",     "CVD Bull Div"  in rl_),
+            ("Real Buying",  inds.get("real_buying",  False)),
+            ("Vol Confirm",  inds.get("vol_ratio",    0) > 1),
+            ("Long Liq",     "Long Liq"      in rl_),
+            ("Funding Short","Funding Short" in rl_),
+            ("OI Long",      "OI Long"       in rl_),
+        ]
+        html = ""
+        for name, active in all_inds:
+            html += chip(name, active, bear=is_bear_sig and active) + " "
+        st.markdown(html, unsafe_allow_html=True)
+
+        st.markdown("---")
+        ci1, ci2, ci3, ci4, ci5 = st.columns(5)
+        ci1.metric("RSI",       f"{inds.get('rsi',       0):.1f}")
+        ci2.metric("MFI",       f"{inds.get('mfi',       0):.1f}")
+        ci3.metric("Stoch K",   f"{inds.get('stoch_k',   0):.1f}")
+        ci4.metric("Vol Ratio", f"{inds.get('vol_ratio', 0):.2f}x")
+        ci5.metric("ATR",       f"${inds.get('atr',      0):,.0f}")
+        st.markdown(
+            f"EMA50: **${inds.get('ema50',0):,.0f}** &nbsp;|&nbsp; "
+            f"EMA200: **${inds.get('ema200',0):,.0f}** &nbsp;|&nbsp; "
+            f"VWAP: **${inds.get('vwap',0):,.0f}** &nbsp;|&nbsp; "
+            f"Bull Flag: **{'🚩 YES' if inds.get('bull_flag') else 'No'}**"
+        )
 
         # ── Regime reasoning ──────────────────────────────────────
         with st.expander("🧠 Regime Detection Reasoning"):
@@ -327,15 +298,11 @@ with tab_signal:
                     "EMA200": tail["ema200"],
                 }), use_container_width=True)
                 st.markdown("**RSI**")
-                st.line_chart(
-                    pd.DataFrame({"RSI": tail["rsi"]}),
-                    use_container_width=True, height=120,
-                )
+                st.line_chart(pd.DataFrame({"RSI": tail["rsi"]}),
+                              use_container_width=True, height=120)
                 st.markdown("**MFI**")
-                st.line_chart(
-                    pd.DataFrame({"MFI": tail["mfi"]}),
-                    use_container_width=True, height=120,
-                )
+                st.line_chart(pd.DataFrame({"MFI": tail["mfi"]}),
+                              use_container_width=True, height=120)
 
     elif sig and "error" in sig:
         st.error(f"Error: {sig['error']}")
@@ -350,54 +317,31 @@ with tab_signal:
 with tab_backtest:
     st.markdown("### Run Backtest")
 
-    # ── Period selector ───────────────────────────────────────────
     period = st.select_slider(
         "Select Period",
         options=["1M", "3M", "6M", "1Y", "3Y"],
         value="1Y",
     )
 
-    # ── Timeframe selector — matches v8.5 notebook Cell 3 ─────────
     st.markdown("**Select Timeframe**")
-    tf_col1, tf_col2 = st.columns(2)
-    with tf_col1:
-        tf_1h = st.radio(
-            "Timeframe",
-            options=[
-                "1H — Hourly candles (more signals)",
-                "1D — Daily candles  (swing)",
-            ],
-            index=0,
-            label_visibility="collapsed",
-        )
-    with tf_col2:
-        st.caption(
-            "**1H** · More signals · Intraday/scalp\n\n"
-            "**1D** · Fewer signals · Swing / hold"
-        )
-    backtest_tf = "1D" if tf_1h.startswith("1D") else "1H"
+    tf_choice = st.radio(
+        "Timeframe",
+        options=["1H — Hourly candles (more signals)", "1D — Daily candles (swing)"],
+        index=0, label_visibility="collapsed",
+    )
+    backtest_tf = "1D" if tf_choice.startswith("1D") else "1H"
 
-    # ── Config params ─────────────────────────────────────────────
     st.markdown("**Parameters** *(regime auto-adjusts SL/TP)*")
     c1, c2, c3 = st.columns(3)
-    min_score = c1.number_input(
-        "Min Score",   value=float(sr.MIN_SCORE),
-        step=0.5, min_value=1.0, max_value=15.0,
-    )
-    atr_sl = c2.number_input(
-        "ATR SL Mult", value=float(sr.ATR_SL),
-        step=0.5, min_value=0.5, max_value=5.0,
-    )
-    atr_tp = c3.number_input(
-        "ATR TP Mult", value=float(sr.ATR_TP),
-        step=0.5, min_value=1.0, max_value=10.0,
-    )
+    min_score = c1.number_input("Min Score",   value=float(sr.MIN_SCORE),
+                                 step=0.5, min_value=1.0, max_value=15.0)
+    atr_sl    = c2.number_input("ATR SL Mult", value=float(sr.ATR_SL),
+                                 step=0.5, min_value=0.5, max_value=5.0)
+    atr_tp    = c3.number_input("ATR TP Mult", value=float(sr.ATR_TP),
+                                 step=0.5, min_value=1.0, max_value=10.0)
 
-    run_btn = st.button(
-        f"🚀 Run Backtest  [{period} · {backtest_tf}]",
-        use_container_width=True,
-        type="primary",
-    )
+    run_btn = st.button(f"🚀 Run Backtest  [{period} · {backtest_tf}]",
+                         use_container_width=True, type="primary")
 
     if run_btn:
         try:
@@ -436,62 +380,71 @@ with tab_backtest:
                 h4_str = "ranging"
             h1_str = sr.detect_local_structure(df, lookback_bars=48, tf_label="1H")
 
+            # Apply regime-aware scoring
             df = sr.compute_scores_regime(
                 df, regime, sr.MIN_CATS, sr.TREND_REQ,
                 h1_structure=h1_str, h4_structure=h4_str,
             )
 
-            # Trim to exact selected period
-            cutoff_ts = pd.Timestamp(
-                datetime.now(timezone.utc) - timedelta(days=days)
-            ).tz_localize(None)
-            df_bt = df[df.index >= cutoff_ts].copy()
+            # Trim to exact backtest period AFTER indicators computed
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            cutoff = cutoff.replace(tzinfo=None)
+            df_bt  = df[df.index >= cutoff] if backtest_tf == "1H" else \
+                     df.resample("1D").last().dropna()
+            df_bt  = df_bt[df_bt.index >= cutoff]
 
-            # Resample to 1D if selected (same as notebook)
-            if backtest_tf == "1D":
-                df_bt = (
-                    df_bt.resample("1D")
-                    .agg({
-                        "open": "first", "high": "max",
-                        "low": "min",   "close": "last",
-                        "volume": "sum", "atr": "last",
-                        "long_signal": "any", "short_signal": "any",
-                    })
-                    .dropna(subset=["close"])
-                )
-
-            n_sig = int(df_bt["long_signal"].sum()) + int(df_bt["short_signal"].sum())
-            if n_sig == 0:
-                st.warning(
-                    f"No signals generated — try lowering Min Score "
-                    f"(currently {min_score})"
-                )
+            if df_bt.empty or df_bt["long_signal"].sum() + df_bt["short_signal"].sum() == 0:
+                st.warning("No signals in selected period. Try lowering Min Score or extending period.")
                 st.stop()
 
-            sl_stop  = df_bt["atr"] * atr_sl / df_bt["close"]
-            tp_stop  = df_bt["atr"] * atr_tp / df_bt["close"]
-            vbt_freq = "1D" if backtest_tf == "1D" else "1h"
+            # VectorBT portfolio
+            rcfg   = sr.get_regime_config(regime)
+            atr_sl_r = rcfg["atr_sl_mult"]
+            atr_tp_r = rcfg["atr_tp_mult"]
 
-            pf = vbt.Portfolio.from_signals(
-                close=df_bt["close"], high=df_bt["high"], low=df_bt["low"],
-                entries=df_bt["long_signal"], short_entries=df_bt["short_signal"],
-                sl_stop=sl_stop, tp_stop=tp_stop,
-                init_cash=sr.INIT_CASH, fees=sr.FEES, slippage=sr.SLIPPAGE,
-                freq=vbt_freq,
-            )
+            closes   = df_bt["close"].astype(float)
+            atr_vals = df_bt["atr"].astype(float)
+            sl_stop  = (atr_vals * atr_sl_r) / closes
+            tp_stop  = (atr_vals * atr_tp_r) / closes
+
+            entries = df_bt["long_signal"]  & ~df_bt["short_signal"]
+            exits   = df_bt["short_signal"] & ~df_bt["long_signal"]
 
             try:
-                t      = pf.trades.records_readable
-                wins   = len(t[t["PnL"] > 0])
-                losses = len(t[t["PnL"] < 0])
-                wr     = wins / len(t) if len(t) > 0 else 0
-                aw     = float(t[t["PnL"] > 0]["PnL"].mean()) if wins   > 0 else 0
-                al     = float(t[t["PnL"] < 0]["PnL"].mean()) if losses > 0 else 0
-                pfr    = abs(aw / al) if al != 0 else 0
-                trades_df = t
+                pf = vbt.Portfolio.from_signals(
+                    closes,
+                    entries   = entries,
+                    exits     = exits,
+                    short_entries = df_bt["short_signal"] if sr.ENABLE_SHORT else None,
+                    short_exits   = df_bt["long_signal"]  if sr.ENABLE_SHORT else None,
+                    init_cash = sr.INIT_CASH,
+                    fees      = sr.FEES,
+                    slippage  = sr.SLIPPAGE,
+                    sl_stop   = sl_stop,
+                    tp_stop   = tp_stop,
+                    freq      = "1h" if backtest_tf == "1H" else "1d",
+                )
+            except Exception as e:
+                st.error(f"VectorBT error: {e}")
+                st.stop()
+
+            # Compute stats
+            try:
+                trades_df = pf.trades.records_readable.copy()
             except Exception:
-                wr = aw = al = pfr = 0
                 trades_df = pd.DataFrame()
+
+            tc = int(pf.trades.count())
+            if tc > 0:
+                try:
+                    wr = float(pf.trades.win_rate())
+                    aw = float(pf.trades.pnl[pf.trades.pnl > 0].mean()) if (pf.trades.pnl > 0).any() else 0.0
+                    al = float(pf.trades.pnl[pf.trades.pnl < 0].mean()) if (pf.trades.pnl < 0).any() else 0.0
+                    pfr = abs(aw / al) if al != 0 else 0.0
+                except Exception:
+                    wr = 0.0; aw = 0.0; al = 0.0; pfr = 0.0
+            else:
+                wr = 0.0; aw = 0.0; al = 0.0; pfr = 0.0
 
             bh = float(df_bt["close"].iloc[-1] / df_bt["close"].iloc[0]) - 1
 
@@ -501,10 +454,7 @@ with tab_backtest:
                 sortino = 0.0
 
             result = {
-                "run_id":        (
-                    f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-                    f"_{period}_{backtest_tf}"
-                ),
+                "run_id":        f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{period}_{backtest_tf}",
                 "run_ts":        datetime.utcnow().isoformat(),
                 "period":        period,
                 "timeframe":     backtest_tf,
@@ -516,10 +466,10 @@ with tab_backtest:
                 "total_return":  round(float(pf.total_return()), 4),
                 "buy_and_hold":  round(bh, 4),
                 "beat_bh":       bool(pf.total_return() > bh),
-                "sharpe_ratio":  round(float(pf.sharpe_ratio()  or 0), 3),
+                "sharpe_ratio":  round(float(pf.sharpe_ratio() or 0), 3),
                 "sortino_ratio": sortino,
                 "max_drawdown":  round(float(pf.max_drawdown()), 4),
-                "total_trades":  int(pf.trades.count()),
+                "total_trades":  tc,
                 "win_rate":      round(wr, 4),
                 "avg_win":       round(aw, 2),
                 "avg_loss":      round(al, 2),
@@ -533,7 +483,6 @@ with tab_backtest:
                     "atr_sl_mult":    atr_sl,
                     "atr_tp_mult":    atr_tp,
                     "enable_shorts":  sr.ENABLE_SHORT,
-                    "cat_weights":    sr.CAT_WEIGHTS,
                 },
             }
 
@@ -545,7 +494,7 @@ with tab_backtest:
     # ── Display results ───────────────────────────────────────────
     r = st.session_state.backtest_result
     if r:
-        rem = REGIME_EMOJI.get(r.get("regime", ""), "❓")
+        rem = REGIME_EMOJI.get(r.get("regime",""), "❓")
         st.markdown(
             f"#### Results — {r['period']} · {r.get('timeframe','1H')}"
             f"  &nbsp; `{r['start']} → {r['end']}`"
@@ -557,8 +506,7 @@ with tab_backtest:
         )
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Return",  f"{r['total_return']:.1%}",
-                  delta=f"B&H: {r['buy_and_hold']:.1%}")
+        c1.metric("Return",  f"{r['total_return']:.1%}", delta=f"B&H: {r['buy_and_hold']:.1%}")
         c2.metric("Sharpe",  f"{r['sharpe_ratio']:.3f}")
         c3.metric("Max DD",  f"{r['max_drawdown']:.1%}")
         c4.metric("Trades",  r["total_trades"])
@@ -568,32 +516,20 @@ with tab_backtest:
         c2.metric("Profit Factor", f"{r['profit_factor']:.3f}")
         c3.metric("Avg Win",       f"${r['avg_win']:,.0f}")
         c4.metric("Avg Loss",      f"${r['avg_loss']:,.0f}")
-
-        st.metric(
-            "Final Value", f"${r['final_value']:,.2f}",
-            delta=f"Started ${r['init_cash']:,.0f}",
-        )
+        st.metric("Final Value", f"${r['final_value']:,.2f}", delta=f"Started ${r['init_cash']:,.0f}")
 
         eq = st.session_state.get("backtest_equity")
         if eq is not None:
             st.markdown("**Equity Curve**")
-            eq_df = eq.reset_index()
-            eq_df.columns = ["Date", "Portfolio Value"]
+            eq_df = eq.reset_index(); eq_df.columns = ["Date", "Portfolio Value"]
             st.line_chart(eq_df.set_index("Date"), use_container_width=True)
 
         tdf = st.session_state.get("backtest_trades_df")
         if tdf is not None and not tdf.empty:
             with st.expander(f"📋 Trade Log ({r['total_trades']} trades)"):
-                display_cols = [
-                    c for c in [
-                        "Direction", "Entry Timestamp", "Entry Price",
-                        "Exit Timestamp", "Exit Price", "PnL", "Return",
-                    ] if c in tdf.columns
-                ]
-                st.dataframe(
-                    tdf[display_cols] if display_cols else tdf,
-                    use_container_width=True,
-                )
+                display_cols = [c for c in ["Direction","Entry Timestamp","Entry Price",
+                                "Exit Timestamp","Exit Price","PnL","Return"] if c in tdf.columns]
+                st.dataframe(tdf[display_cols] if display_cols else tdf, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -613,10 +549,7 @@ with tab_history:
                 "Run ID":    r.get("run_id", ""),
                 "Period":    r.get("period", ""),
                 "TF":        r.get("timeframe", "1H"),
-                "Regime":    (
-                    f"{REGIME_EMOJI.get(r.get('regime',''), '❓')} "
-                    f"{r.get('regime','')}"
-                ),
+                "Regime":    f"{REGIME_EMOJI.get(r.get('regime',''), '❓')} {r.get('regime','')}",
                 "Return":    f"{r.get('total_return', 0):.1%}",
                 "Sharpe":    f"{r.get('sharpe_ratio', 0):.3f}",
                 "Max DD":    f"{r.get('max_drawdown', 0):.1%}",
@@ -651,57 +584,34 @@ with tab_learn:
     if not mem:
         st.info("Run at least 2–3 backtests to see learning insights.")
     else:
-        ranked = sorted(mem, key=lambda x: x.get("sharpe_ratio", 0), reverse=True)
-        best   = ranked[0]
-        worst  = ranked[-1]
-
-        st.success(
-            f"🥇 Best: {best['period']} {best.get('timeframe','1H')}  |  "
-            f"{REGIME_EMOJI.get(best.get('regime',''),'')}{best.get('regime','')}  |  "
-            f"Return: {best['total_return']:.1%}  |  Sharpe: {best['sharpe_ratio']:.3f}"
-        )
-        st.error(
-            f"🔴 Worst: {worst['period']} {worst.get('timeframe','1H')}  |  "
-            f"Return: {worst['total_return']:.1%}  |  Sharpe: {worst['sharpe_ratio']:.3f}"
-        )
-
-        profitable = [r for r in mem if r["total_return"] > 0]
-        beat_bh    = [r for r in mem if r.get("beat_bh")]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Runs",  len(mem))
-        c2.metric("Profitable",  f"{len(profitable)}/{len(mem)}")
-        c3.metric("Beat B&H",    f"{len(beat_bh)}/{len(mem)}")
+        summary = sr.get_learning_summary()
+        st.text(summary)
 
         # Regime breakdown
         by_regime = {}
         for r in mem:
-            reg = r.get("regime", "UNKNOWN")
-            if reg not in by_regime:
-                by_regime[reg] = []
-            by_regime[reg].append(r)
+            rg = r.get("regime", "UNKNOWN")
+            if rg not in by_regime: by_regime[rg] = []
+            by_regime[rg].append(r)
         if by_regime:
             st.markdown("**📊 Performance by Regime**")
             regime_rows = []
-            for reg, runs in sorted(by_regime.items()):
+            for rg, runs in sorted(by_regime.items()):
                 regime_rows.append({
-                    "Regime":     f"{REGIME_EMOJI.get(reg,'❓')} {reg}",
+                    "Regime":     f"{REGIME_EMOJI.get(rg,'?')} {rg}",
                     "Runs":       len(runs),
                     "Avg Return": f"{sum(r['total_return'] for r in runs)/len(runs):.1%}",
                     "Avg Sharpe": f"{sum(r['sharpe_ratio'] for r in runs)/len(runs):.3f}",
                     "Win Rate":   f"{sum(r['win_rate'] for r in runs)/len(runs):.1%}",
                     "Beat B&H":   f"{sum(1 for r in runs if r.get('beat_bh'))}/{len(runs)}",
                 })
-            st.dataframe(
-                pd.DataFrame(regime_rows),
-                use_container_width=True, hide_index=True,
-            )
+            st.dataframe(pd.DataFrame(regime_rows), use_container_width=True, hide_index=True)
 
         # Timeframe breakdown
         by_tf = {}
         for r in mem:
             tf = r.get("timeframe", "1H")
-            if tf not in by_tf:
-                by_tf[tf] = []
+            if tf not in by_tf: by_tf[tf] = []
             by_tf[tf].append(r)
         if len(by_tf) > 1:
             st.markdown("**⏱ Performance by Timeframe**")
@@ -714,67 +624,4 @@ with tab_learn:
                     "Avg Sharpe": f"{sum(r['sharpe_ratio'] for r in runs)/len(runs):.3f}",
                     "Win Rate":   f"{sum(r['win_rate'] for r in runs)/len(runs):.1%}",
                 })
-            st.dataframe(
-                pd.DataFrame(tf_rows),
-                use_container_width=True, hide_index=True,
-            )
-
-        # Period analysis
-        by_period = {}
-        for r in mem:
-            p = r["period"]
-            if p not in by_period:
-                by_period[p] = []
-            by_period[p].append(r["sharpe_ratio"])
-        st.markdown("**Average Sharpe by Period**")
-        period_df = pd.DataFrame([
-            {"Period": p, "Avg Sharpe": round(sum(v) / len(v), 3), "Runs": len(v)}
-            for p, v in by_period.items()
-        ]).sort_values("Avg Sharpe", ascending=False)
-        st.dataframe(period_df, use_container_width=True, hide_index=True)
-
-        # Min score sensitivity
-        scores_tested = list(set(
-            r["config"].get("min_score", "")
-            for r in mem if "config" in r
-        ))
-        if len(scores_tested) > 1:
-            st.markdown("**Min Score Sensitivity**")
-            score_rows = []
-            for sc in sorted(s for s in scores_tested if s):
-                runs = [
-                    r for r in mem
-                    if r.get("config", {}).get("min_score") == sc
-                ]
-                if runs:
-                    score_rows.append({
-                        "Min Score":  sc,
-                        "Avg Sharpe": round(
-                            sum(r["sharpe_ratio"] for r in runs) / len(runs), 3
-                        ),
-                        "Avg Return": (
-                            f"{sum(r['total_return'] for r in runs)/len(runs):.1%}"
-                        ),
-                        "Runs":       len(runs),
-                    })
-            if score_rows:
-                st.dataframe(
-                    pd.DataFrame(score_rows),
-                    use_container_width=True, hide_index=True,
-                )
-
-        # Best config recommendation
-        st.markdown("**💡 Recommended Config (best Sharpe run)**")
-        bc = best.get("config", {})
-        col1, col2 = st.columns(2)
-        col1.code(
-            f"MIN_SCORE      = {bc.get('min_score','?')}\n"
-            f"MIN_CATEGORIES = {bc.get('min_categories','?')}\n"
-            f"TREND_REQUIRED = {bc.get('trend_required','?')}\n"
-            f"ATR_SL_MULT    = {bc.get('atr_sl_mult','?')}\n"
-            f"ATR_TP_MULT    = {bc.get('atr_tp_mult','?')}\n"
-            f"TIMEFRAME      = {best.get('timeframe','1H')}"
-        )
-        col2.metric("Expected Return", f"{best['total_return']:.1%}")
-        col2.metric("Expected Sharpe", f"{best['sharpe_ratio']:.3f}")
-        col2.metric("Best Period",     f"{best['period']} {best.get('timeframe','1H')}")
+            st.dataframe(pd.DataFrame(tf_rows), use_container_width=True, hide_index=True)
