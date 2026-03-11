@@ -428,21 +428,38 @@ with tab_backtest:
                 st.error(f"VectorBT error: {e}")
                 st.stop()
 
-            # Compute stats
+            # Compute stats — read from records_readable for VectorBT compatibility
             try:
                 trades_df = pf.trades.records_readable.copy()
             except Exception:
                 trades_df = pd.DataFrame()
 
             tc = int(pf.trades.count())
-            if tc > 0:
-                try:
-                    wr = float(pf.trades.win_rate())
-                    aw = float(pf.trades.pnl[pf.trades.pnl > 0].mean()) if (pf.trades.pnl > 0).any() else 0.0
-                    al = float(pf.trades.pnl[pf.trades.pnl < 0].mean()) if (pf.trades.pnl < 0).any() else 0.0
-                    pfr = abs(aw / al) if al != 0 else 0.0
-                except Exception:
-                    wr = 0.0; aw = 0.0; al = 0.0; pfr = 0.0
+            if tc > 0 and not trades_df.empty:
+                # Normalise column names (vbt versions differ: "PnL" vs "pnl" vs "P&L")
+                col_lower = {c: c.lower().replace(" ","_").replace("&","") for c in trades_df.columns}
+                trades_df_n = trades_df.rename(columns=col_lower)
+                pnl_col = next((c for c in trades_df_n.columns
+                                if c in ("pnl","pl","p_l","realized_pnl","profit")), None)
+                if pnl_col:
+                    pnl_series = pd.to_numeric(trades_df_n[pnl_col], errors="coerce").dropna()
+                    wins   = pnl_series[pnl_series > 0]
+                    losses = pnl_series[pnl_series < 0]
+                    wr  = len(wins) / len(pnl_series) if len(pnl_series) > 0 else 0.0
+                    aw  = float(wins.mean())   if len(wins)   > 0 else 0.0
+                    al  = float(losses.mean()) if len(losses) > 0 else 0.0
+                    pfr = abs(aw / al)         if al != 0 else 0.0
+                    # also patch trades_df so trade log shows correct data
+                    trades_df = trades_df_n
+                else:
+                    # Fallback: try vbt accessor
+                    try:
+                        wr  = float(pf.trades.win_rate())
+                        aw  = float(pf.trades.winning.pnl.mean()) if pf.trades.winning.count() > 0 else 0.0
+                        al  = float(pf.trades.losing.pnl.mean())  if pf.trades.losing.count()  > 0 else 0.0
+                        pfr = abs(aw / al) if al != 0 else 0.0
+                    except Exception:
+                        wr = 0.0; aw = 0.0; al = 0.0; pfr = 0.0
             else:
                 wr = 0.0; aw = 0.0; al = 0.0; pfr = 0.0
 
