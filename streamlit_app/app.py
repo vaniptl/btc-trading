@@ -320,7 +320,16 @@ with tab_backtest:
 
             # v8.5 regime-aware scoring
             regime, regime_reasons = sr.detect_regime(df, df_4h_ext=df_4h, df_1d_ext=df_1d)
-            h4_str = sr.detect_local_structure(df_4h, lookback_bars=30, tf_label="4H") if not df_4h.empty else "ranging"
+            if not df_4h.empty:
+                df_4h_ind = df_4h.copy()
+                df_4h_ind["ema8"]  = sr._ema(df_4h_ind["close"], 8)
+                df_4h_ind["ema21"] = sr._ema(df_4h_ind["close"], 21)
+                df_4h_ind["ema55"] = sr._ema(df_4h_ind["close"], 55)
+                df_4h_ind["rsi"]   = sr._rsi(df_4h_ind["close"])
+                df_4h_ind["atr"]   = sr._atr(df_4h_ind)
+                h4_str = sr.detect_local_structure(df_4h_ind, lookback_bars=30, tf_label="4H")
+            else:
+                h4_str = "ranging"
             h1_str = sr.detect_local_structure(df, lookback_bars=48, tf_label="1H")
             rcfg   = sr.get_regime_config(regime)
             # Apply user-tuned SL/TP on top of regime config
