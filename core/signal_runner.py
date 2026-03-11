@@ -836,7 +836,17 @@ def get_signal():
     df = compute_indicators(df_1h, df_4h, df_1d, liq_df, fund_df, oi_df)
     regime, regime_reasons = detect_regime(df, df_4h_ext=df_4h, df_1d_ext=df_1d)
     rcfg = get_regime_config(regime)
-    h4_str = detect_local_structure(df_4h, lookback_bars=30, tf_label="4H") if not df_4h.empty else "ranging"
+    # detect_local_structure needs ema8/21/55, rsi, atr computed on that timeframe
+    if not df_4h.empty:
+        df_4h_ind = df_4h.copy()
+        df_4h_ind["ema8"]  = _ema(df_4h_ind["close"], 8)
+        df_4h_ind["ema21"] = _ema(df_4h_ind["close"], 21)
+        df_4h_ind["ema55"] = _ema(df_4h_ind["close"], 55)
+        df_4h_ind["rsi"]   = _rsi(df_4h_ind["close"])
+        df_4h_ind["atr"]   = _atr(df_4h_ind)
+        h4_str = detect_local_structure(df_4h_ind, lookback_bars=30, tf_label="4H")
+    else:
+        h4_str = "ranging"
     h1_str = detect_local_structure(df, lookback_bars=48, tf_label="1H")
     df     = compute_scores_regime(df, regime, MIN_CATS, TREND_REQ, h1_structure=h1_str, h4_structure=h4_str)
 
