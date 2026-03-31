@@ -109,36 +109,45 @@ BINANCE_SPOT_URL  = "https://api.binance.com/api/v3/klines"
 BINANCE_FAPI_URL  = "https://fapi.binance.com/fapi/v1"
 BINANCE_FDATA_URL = "https://fapi.binance.com/futures/data"
 
+# Add this constant at the top of signal_runner.py
+BINANCE_DATA_URL = "https://data-api.binance.vision/api/v3/klines"
+
 def fetch_ohlcv_binance(symbol="BTCUSDT", interval="1h", days_back=365):
-    limit     = min(1000, int(days_back * 1440 / {"1h":60,"4h":240,"1d":1440}.get(interval,60)))
-    end_ms    = int(time.time() * 1000)
-    start_ms  = end_ms - int(days_back * 86_400_000)
-    all_data  = []
-    while start_ms < end_ms:
+    end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = end_ms - int(days_back * 86_400_000)
+    ms_step  = INTERVAL_MS.get(interval, 3_600_000)
+    all_data, cur = [], start_ms
+    
+    while cur < end_ms:
         try:
-            r = requests.get(BINANCE_SPOT_URL, params={
-                "symbol": symbol, "interval": interval,
-                "startTime": start_ms, "endTime": end_ms, "limit": 1000,
-            }, timeout=15)
-            raw = r.json()
-            if not isinstance(raw, list) or not raw: break
-            all_data.extend(raw)
-            start_ms = int(raw[-1][0]) + 1
-            if len(raw) < 1000: break
-            time.sleep(0.1)
+            r = requests.get(
+                BINANCE_DATA_URL,   # <-- use the no-auth mirror
+                params={
+                    "symbol": symbol, "interval": interval,
+                    "startTime": cur, "endTime": end_ms, "limit": 1000,
+                },
+                timeout=20,
+            )
+            r.raise_for_status()
+            batch = r.json()
+            if not batch: break
+            all_data.extend(batch)
+            cur = batch[-1][0] + ms_step
+            if len(batch) < 1000: break
+            time.sleep(0.12)
         except Exception as e:
             print(f"Binance error: {e}"); break
+    
     if not all_data: return pd.DataFrame()
     df = pd.DataFrame(all_data, columns=[
         "open_time","open","high","low","close","volume",
-        "close_time","qav","trades","tbbav","tbqav","ignore"])
+        "close_time","qv","nt","tbv","tbq","ig"])
     df["datetime"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_localize(None)
     df = df.set_index("datetime")
     for c in ["open","high","low","close","volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df[["open","high","low","close","volume"]]
     return df[df["volume"] > 0].sort_index()[~df.index.duplicated(keep="last")]
-
 def fetch_ohlcv_cc(unit="hour", aggregate=1, days_back=365):
     eps = {
         "hour": "https://min-api.cryptocompare.com/data/v2/histohour",
@@ -174,12 +183,20 @@ def fetch_ohlcv_cc(unit="hour", aggregate=1, days_back=365):
     df = df[df["volume"] > 0].sort_index()
     return df[~df.index.duplicated(keep="last")]
 
+# In signal_runner.py — replace the entire fetch_ohlcv() function with this:
+
 def fetch_ohlcv(unit="hour", aggregate=1, days_back=365):
-    """Binance primary, CryptoCompare fallback"""
-    interval_map = {("hour",1): "1h", ("hour",4): "4h", ("day",1): "1d"}
+    """Binance PUBLIC API (no key needed) — always primary. CC only if Binance fails."""
+    interval_map = {("hour", 1): "1h", ("hour", 4): "4h", ("day", 1): "1d"}
     interval = interval_map.get((unit, aggregate), "1h")
+    
+    # ── ALWAYS try Binance first — NO API KEY REQUIRED ─────────
     df = fetch_ohlcv_binance("BTCUSDT", interval, days_back)
-    if not df.empty: return df
+    if not df.empty:
+        return df
+    
+    # ── Only fall back to CC if Binance is actually down ────────
+    print(f"[WARNING] Binance failed for {interval}, trying CryptoCompare fallback...")
     return fetch_ohlcv_cc(unit, aggregate, days_back)
 
 def fetch_liquidations(max_days=30):
