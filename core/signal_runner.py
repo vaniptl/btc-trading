@@ -105,7 +105,7 @@ REGIME_CONFIGS = {
 # BINANCE + CRYPTOCOMPARE DATA FETCHERS
 # ══════════════════════════════════════════════════════════════════
 
-BINANCE_SPOT_URL  = "https://api.binance.com/api/v3/klines"
+BINANCE_SPOT_URL = "https://data-api.binance.vision/api/v3/klines"
 BINANCE_FAPI_URL  = "https://fapi.binance.com/fapi/v1"
 BINANCE_FDATA_URL = "https://fapi.binance.com/futures/data"
 
@@ -186,19 +186,15 @@ def fetch_ohlcv_cc(unit="hour", aggregate=1, days_back=365):
 # In signal_runner.py — replace the entire fetch_ohlcv() function with this:
 
 def fetch_ohlcv(unit="hour", aggregate=1, days_back=365):
-    """Binance PUBLIC API (no key needed) — always primary. CC only if Binance fails."""
+    """Binance public API (no key) — primary. CC fallback only if Binance fails."""
     interval_map = {("hour", 1): "1h", ("hour", 4): "4h", ("day", 1): "1d"}
     interval = interval_map.get((unit, aggregate), "1h")
-    
-    # ── ALWAYS try Binance first — NO API KEY REQUIRED ─────────
     df = fetch_ohlcv_binance("BTCUSDT", interval, days_back)
     if not df.empty:
         return df
-    
-    # ── Only fall back to CC if Binance is actually down ────────
-    print(f"[WARNING] Binance failed for {interval}, trying CryptoCompare fallback...")
+    print(f"[WARN] Binance failed for {interval}, trying CC fallback...")
     return fetch_ohlcv_cc(unit, aggregate, days_back)
-
+  
 def fetch_liquidations(max_days=30):
     url, all_orders = f"{BINANCE_FAPI_URL}/allForceOrders", []
     end_ms, day_ms = int(time.time()*1000), 86_400_000
