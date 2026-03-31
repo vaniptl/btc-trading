@@ -105,23 +105,28 @@ REGIME_CONFIGS = {
 # BINANCE + CRYPTOCOMPARE DATA FETCHERS
 # ══════════════════════════════════════════════════════════════════
 
-BINANCE_SPOT_URL = "https://data-api.binance.vision/api/v3/klines"
+BINANCE_SPOT_URL  = "https://data-api.binance.vision/api/v3/klines"
 BINANCE_FAPI_URL  = "https://fapi.binance.com/fapi/v1"
 BINANCE_FDATA_URL = "https://fapi.binance.com/futures/data"
+BINANCE_DATA_URL  = "https://data-api.binance.vision/api/v3/klines"
 
 # Add this constant at the top of signal_runner.py
-BINANCE_DATA_URL = "https://data-api.binance.vision/api/v3/klines"
+INTERVAL_MS = {
+    "1h":  3_600_000,
+    "4h": 14_400_000,
+    "1d": 86_400_000,
+}
 
 def fetch_ohlcv_binance(symbol="BTCUSDT", interval="1h", days_back=365):
     end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = end_ms - int(days_back * 86_400_000)
     ms_step  = INTERVAL_MS.get(interval, 3_600_000)
     all_data, cur = [], start_ms
-    
+
     while cur < end_ms:
         try:
             r = requests.get(
-                BINANCE_DATA_URL,   # <-- use the no-auth mirror
+                BINANCE_DATA_URL,
                 params={
                     "symbol": symbol, "interval": interval,
                     "startTime": cur, "endTime": end_ms, "limit": 1000,
@@ -130,15 +135,22 @@ def fetch_ohlcv_binance(symbol="BTCUSDT", interval="1h", days_back=365):
             )
             r.raise_for_status()
             batch = r.json()
-            if not batch: break
+            if not batch or not isinstance(batch, list):
+                break
             all_data.extend(batch)
-            cur = batch[-1][0] + ms_step
-            if len(batch) < 1000: break
+            last_open_time = batch[-1][0]
+            cur = last_open_time + ms_step
+            # ← FIXED: only break if we've caught up to now, not on short batch
+            if last_open_time >= end_ms - ms_step:
+                break
             time.sleep(0.12)
         except Exception as e:
-            print(f"Binance error: {e}"); break
-    
-    if not all_data: return pd.DataFrame()
+            print(f"[Binance OHLCV error] {e}")
+            break
+
+    if not all_data:
+        return pd.DataFrame()
+
     df = pd.DataFrame(all_data, columns=[
         "open_time","open","high","low","close","volume",
         "close_time","qv","nt","tbv","tbq","ig"])
@@ -148,6 +160,7 @@ def fetch_ohlcv_binance(symbol="BTCUSDT", interval="1h", days_back=365):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df[["open","high","low","close","volume"]]
     return df[df["volume"] > 0].sort_index()[~df.index.duplicated(keep="last")]
+  
 def fetch_ohlcv_cc(unit="hour", aggregate=1, days_back=365):
     eps = {
         "hour": "https://min-api.cryptocompare.com/data/v2/histohour",
@@ -186,13 +199,16 @@ def fetch_ohlcv_cc(unit="hour", aggregate=1, days_back=365):
 # In signal_runner.py — replace the entire fetch_ohlcv() function with this:
 
 def fetch_ohlcv(unit="hour", aggregate=1, days_back=365):
-    """Binance public API (no key) — primary. CC fallback only if Binance fails."""
+    """Binance public API — no key needed. CC only if Binance completely fails."""
     interval_map = {("hour", 1): "1h", ("hour", 4): "4h", ("day", 1): "1d"}
     interval = interval_map.get((unit, aggregate), "1h")
+    
     df = fetch_ohlcv_binance("BTCUSDT", interval, days_back)
     if not df.empty:
         return df
-    print(f"[WARN] Binance failed for {interval}, trying CC fallback...")
+    
+    # Only reach here if Binance is actually down
+    print(f"[WARN] Binance failed for {interval} — trying CC fallback")
     return fetch_ohlcv_cc(unit, aggregate, days_back)
   
 def fetch_liquidations(max_days=30):
@@ -206,20 +222,28 @@ def fetch_liquidations(max_days=30):
                 "endTime": end_ms, "limit": 1000,
             }, timeout=15)
             raw = r.json()
-            if isinstance(raw, list): all_orders.extend(raw)
-        except: pass
+            if isinstance(raw, list):
+                all_orders.extend(raw)
+        except:
+            pass
         end_ms = start_ms
         time.sleep(0.1)
-    if not all_orders: return pd.DataFrame()
+
+    if not all_orders:
+        return pd.DataFrame()
+
     df = pd.DataFrame(all_orders)
     df["datetime"] = pd.to_datetime(pd.to_numeric(df["time"], errors="coerce"), unit="ms")
     df = df.dropna(subset=["datetime"]).set_index("datetime").sort_index()
-    df["price"]  = pd.to_numeric(df["price"],          errors="coerce")
-    df["qty"]    = pd.to_numeric(df["origQty"],        errors="coerce")
-    df["side"]   = df["side"].astype(str)
-    df["value"]  = df["price"] * df["qty"]
-    return df[["side","price","qty","value"]].dropna()
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
 
+    # ← FIXED: Binance uses executedQty not origQty
+    qty_col = "executedQty" if "executedQty" in df.columns else "origQty"
+    df["qty"]   = pd.to_numeric(df[qty_col], errors="coerce")
+    df["side"]  = df["side"].astype(str)
+    df["value"] = df["price"] * df["qty"]
+    return df[["side","price","qty","value"]].dropna()
+  
 def fetch_funding():
     try:
         r   = requests.get(f"{BINANCE_FAPI_URL}/fundingRate",
