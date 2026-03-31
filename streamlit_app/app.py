@@ -359,8 +359,13 @@ with tab_backtest:
             fund_df = sr.fetch_funding()
             oi_df   = sr.fetch_oi()
 
+            with st.expander("🔍 Debug — Data Fetch Status"):
+                st.write(f"df_1h rows: {len(df_1h)}")
+                st.write(f"df_4h rows: {len(df_4h)}")
+                st.write(f"df_1d rows: {len(df_1d)}")
+
             if df_1h.empty:
-                st.error("No OHLCV data — check CRYPTOCOMPARE_API_KEY in secrets")
+                st.error("No OHLCV data — Binance API unreachable. Check your internet connection or try again.")
                 st.stop()
 
             # Compute indicators on full warmup history
