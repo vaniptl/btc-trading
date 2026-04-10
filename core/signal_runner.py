@@ -16,6 +16,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from intelligence.intelligence_hub import run_intelligence_layer
 
 # ── Config from environment variables ─────────────────────────────
 CC_API_KEY   = os.environ.get("CRYPTOCOMPARE_API_KEY", "")
@@ -1050,7 +1051,8 @@ def get_signal():
     ]
     reasons_long  = [n for n, fl, _  in indicator_map if fl]
     reasons_short = [n for n, _,  fs in indicator_map if fs]
-
+    intel = run_intelligence_layer(direction, ls, regime, price, ema50, ema200, ...)
+  
     return {
         "timestamp":      datetime.utcnow().isoformat(),
         "price":          round(price, 2),
@@ -1088,6 +1090,8 @@ def get_signal():
             "real_selling": bool(row.get("real_selling")),
         },
         "df": df,
+      "intelligence": intel,
+      "execution_decision": intel.get("execution")
     }
 
 
