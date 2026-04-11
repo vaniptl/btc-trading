@@ -9,6 +9,9 @@ FIXES in this version:
   ✅ fetch_ohlcv() — Binance always first, CC only true fallback
   ✅ fetch_liquidations — fixed origQty → executedQty column name
   ✅ get_signal() — added per-source error logging for easier debugging
+  ✅ FIX: run_intelligence_layer() call uses ema50_v / ema200_v (correct local var names)
+  ✅ FIX: Order block loop uses boolean mask accumulation (no ChainedAssignmentError)
+  ✅ FIX: intelligence import wrapped in try/except (graceful fallback if unavailable)
 """
 
 import os, json, time, requests
@@ -16,7 +19,13 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from intelligence.intelligence_hub import run_intelligence_layer
+
+# ── Intelligence Layer — optional, graceful fallback if unavailable ─
+try:
+    from intelligence.intelligence_hub import run_intelligence_layer
+    INTELLIGENCE_AVAILABLE = True
+except ImportError:
+    INTELLIGENCE_AVAILABLE = False
 
 # ── Config from environment variables ─────────────────────────────
 CC_API_KEY   = os.environ.get("CRYPTOCOMPARE_API_KEY", "")
@@ -98,12 +107,10 @@ REGIME_CONFIGS = {
 # DATA FETCHERS
 # ══════════════════════════════════════════════════════════════════
 
-# ── URL constants ─────────────────────────────────────────────────
 BINANCE_SPOT_URL  = "https://data-api.binance.vision/api/v3/klines"
 BINANCE_FAPI_URL  = "https://fapi.binance.com/fapi/v1"
 BINANCE_FDATA_URL = "https://fapi.binance.com/futures/data"
 
-# ── FIX 1: INTERVAL_MS was missing — caused NameError on every fetch ──
 INTERVAL_MS = {
     "1h":  3_600_000,
     "4h": 14_400_000,
@@ -112,13 +119,8 @@ INTERVAL_MS = {
 
 
 def fetch_ohlcv_binance(symbol="BTCUSDT", interval="1h", days_back=365):
-    """
-    Fetch OHLCV from Binance public API — NO API KEY REQUIRED.
-    Uses data-api.binance.vision which is the official no-auth mirror.
-    """
     end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = end_ms - int(days_back * 86_400_000)
-    # FIX 1: INTERVAL_MS now defined above — no more NameError
     ms_step  = INTERVAL_MS.get(interval, 3_600_000)
     all_data = []
     cur      = start_ms
@@ -144,8 +146,6 @@ def fetch_ohlcv_binance(symbol="BTCUSDT", interval="1h", days_back=365):
 
             all_data.extend(batch)
             last_open_time = batch[-1][0]
-
-            # FIX 2: advance cursor correctly; only stop when we've reached now
             cur = last_open_time + ms_step
             if last_open_time >= end_ms - ms_step:
                 break
@@ -176,7 +176,6 @@ def fetch_ohlcv_binance(symbol="BTCUSDT", interval="1h", days_back=365):
 
 
 def fetch_ohlcv_cc(unit="hour", aggregate=1, days_back=365):
-    """CryptoCompare fallback — only used if Binance completely fails."""
     eps = {
         "hour": "https://min-api.cryptocompare.com/data/v2/histohour",
         "day":  "https://min-api.cryptocompare.com/data/v2/histoday",
@@ -225,25 +224,16 @@ def fetch_ohlcv_cc(unit="hour", aggregate=1, days_back=365):
 
 
 def fetch_ohlcv(unit="hour", aggregate=1, days_back=365):
-    """
-    FIX 3: Binance is ALWAYS primary (no API key needed).
-    CryptoCompare only called if Binance returns empty.
-    """
     interval_map = {("hour", 1): "1h", ("hour", 4): "4h", ("day", 1): "1d"}
     interval = interval_map.get((unit, aggregate), "1h")
-
-    # Always try Binance first — completely free, no key
     df = fetch_ohlcv_binance("BTCUSDT", interval, days_back)
     if not df.empty:
         return df
-
-    # Only reach here if Binance is actually unreachable
     print(f"[fetch_ohlcv] ⚠️ Binance empty for {interval} — trying CC fallback")
     return fetch_ohlcv_cc(unit, aggregate, days_back)
 
 
 def fetch_liquidations(max_days=30):
-    """FIX 4: Changed origQty → executedQty (correct Binance field name)."""
     url        = f"{BINANCE_FAPI_URL}/allForceOrders"
     all_orders = []
     end_ms     = int(time.time() * 1000)
@@ -273,8 +263,6 @@ def fetch_liquidations(max_days=30):
     df["datetime"] = pd.to_datetime(pd.to_numeric(df["time"], errors="coerce"), unit="ms")
     df = df.dropna(subset=["datetime"]).set_index("datetime").sort_index()
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
-
-    # FIX 4: use executedQty (Binance actual column), fall back to origQty
     qty_col    = "executedQty" if "executedQty" in df.columns else "origQty"
     df["qty"]  = pd.to_numeric(df[qty_col], errors="coerce")
     df["side"] = df["side"].astype(str)
@@ -319,14 +307,12 @@ def fetch_oi():
 
 
 def get_live_price():
-    # Try Binance first (no key needed)
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/price",
                          params={"symbol": "BTCUSDT"}, timeout=10)
         return float(r.json()["price"])
     except:
         pass
-    # CC fallback for price
     try:
         r = requests.get("https://min-api.cryptocompare.com/data/price",
                          params={"fsym": "BTC", "tsyms": "USD"}, timeout=10)
@@ -547,17 +533,25 @@ def compute_indicators(df, df_4h, df_1d, liq_df, funding_df, oi_df):
     df["near_fib100"]  = (df["close"] - fib100).abs() / safe_close < 0.008
     df["near_fib1618"] = (df["close"] - fib1618).abs()/ safe_close < 0.008
 
+    # ── FIX: Order Blocks — boolean mask accumulation (no ChainedAssignmentError) ──
     ob_window = 10
-    df["in_bullish_ob"] = pd.Series(False, index=df.index)
-    df["in_bearish_ob"] = pd.Series(False, index=df.index)
+    bull_ob_mask = pd.Series(False, index=df.index)
+    bear_ob_mask = pd.Series(False, index=df.index)
     for i in range(ob_window, len(df)):
-        w   = df.iloc[i-ob_window:i]
-        bear_idx = w["close"].idxmin(); bull_idx = w["close"].idxmax()
-        bear_ob_lo = float(df.loc[bear_idx, "low"]);  bear_ob_hi = float(df.loc[bear_idx, "high"])
-        bull_ob_lo = float(df.loc[bull_idx, "low"]);  bull_ob_hi = float(df.loc[bull_idx, "high"])
+        w        = df.iloc[i-ob_window:i]
+        bear_idx = w["close"].idxmin()
+        bull_idx = w["close"].idxmax()
+        bear_ob_lo = float(df.loc[bear_idx, "low"])
+        bear_ob_hi = float(df.loc[bear_idx, "high"])
+        bull_ob_lo = float(df.loc[bull_idx, "low"])
+        bull_ob_hi = float(df.loc[bull_idx, "high"])
         cur_c = float(df["close"].iloc[i])
-        if bear_ob_lo <= cur_c <= bear_ob_hi: df["in_bullish_ob"].iloc[i] = True
-        if bull_ob_lo <= cur_c <= bull_ob_hi: df["in_bearish_ob"].iloc[i] = True
+        if bear_ob_lo <= cur_c <= bear_ob_hi:
+            bull_ob_mask.iloc[i] = True
+        if bull_ob_lo <= cur_c <= bull_ob_hi:
+            bear_ob_mask.iloc[i] = True
+    df["in_bullish_ob"] = bull_ob_mask
+    df["in_bearish_ob"] = bear_ob_mask
 
     rsi_v2 = df["rsi"].values; close_v = df["close"].values
     rbd, rbb, rhb, rhbr = [False]*len(df), [False]*len(df), [False]*len(df), [False]*len(df)
@@ -945,10 +939,10 @@ def get_signal():
     print(f"[get_signal] 4H: {len(df_4h)} rows")
     df_1d  = fetch_ohlcv("day",  1, days_back=260)
     print(f"[get_signal] 1D: {len(df_1d)} rows")
-    liq_df = fetch_liquidations(max_days=3)
-    fund_df= fetch_funding()
-    oi_df  = fetch_oi()
-    price  = get_live_price()
+    liq_df  = fetch_liquidations(max_days=3)
+    fund_df = fetch_funding()
+    oi_df   = fetch_oi()
+    price   = get_live_price()
 
     if df_1h.empty:
         return {"error": "Could not fetch OHLCV data — Binance unreachable and CC over quota"}
@@ -983,8 +977,8 @@ def get_signal():
     poc_v    = float(row.get("poc", 0))
     vah_v    = float(row.get("vah", 0))
     val_v    = float(row.get("val", 0))
-    ema50_v  = float(row.get("ema50",  0))
-    ema200_v = float(row.get("ema200", 0))
+    ema50_v  = float(row.get("ema50",  0))   # ← correct local variable name
+    ema200_v = float(row.get("ema200", 0))   # ← correct local variable name
     is_up    = price > ema200_v
     sl_mult  = rcfg["atr_sl_mult"]
     tp_mult  = rcfg["atr_tp_mult"]
@@ -1051,30 +1045,59 @@ def get_signal():
     ]
     reasons_long  = [n for n, fl, _  in indicator_map if fl]
     reasons_short = [n for n, _,  fs in indicator_map if fs]
-    intel = run_intelligence_layer(direction, ls, regime, price, ema50, ema200, ...)
-  
+
+    # ── FIX: Intelligence Layer — correct variable names + graceful fallback ──
+    intel = {}
+    if INTELLIGENCE_AVAILABLE:
+        try:
+            ep = entry_plan or {}
+            intel = run_intelligence_layer(
+                signal_direction = direction,
+                tech_score       = ls if lsig else ss,
+                regime           = regime,
+                btc_price        = price,
+                ema50            = ema50_v,       # ← was 'ema50'  (undefined) — now correct
+                ema200           = ema200_v,      # ← was 'ema200' (undefined) — now correct
+                entry_price      = ep.get("entry",       price),
+                stop_loss        = ep.get("stop_loss",   price - atr_v * sl_mult),
+                take_profit      = ep.get("take_profit", price + atr_v * tp_mult),
+                h1_structure     = h1_str,
+                h4_structure     = h4_str,
+                account_value    = INIT_CASH,
+                run_research     = True,
+                run_polymarket   = True,
+                timeout_seconds  = 40,
+            )
+            exec_decision = intel.get("execution", {})
+            if exec_decision and not exec_decision.get("approved", True):
+                intel["execution_blocked"] = True
+                intel["block_reason"]      = exec_decision.get("rejection_reason", "")
+        except Exception as _ie:
+            import traceback as _tb
+            intel = {"errors": [str(_ie)], "traceback": _tb.format_exc()[:500]}
+
     return {
-        "timestamp":      datetime.utcnow().isoformat(),
-        "price":          round(price, 2),
-        "direction":      direction,
-        "regime":         regime,
-        "regime_reasons": regime_reasons,
-        "regime_config":  {k:v for k,v in rcfg.items() if k != "weights"},
-        "h1_structure":   h1_str,
-        "h4_structure":   h4_str,
-        "bear_override":  df.attrs.get("bear_override", "NONE"),
-        "long_score":     round(ls, 2),
-        "short_score":    round(ss, 2),
+        "timestamp":          datetime.utcnow().isoformat(),
+        "price":              round(price, 2),
+        "direction":          direction,
+        "regime":             regime,
+        "regime_reasons":     regime_reasons,
+        "regime_config":      {k:v for k,v in rcfg.items() if k != "weights"},
+        "h1_structure":       h1_str,
+        "h4_structure":       h4_str,
+        "bear_override":      df.attrs.get("bear_override", "NONE"),
+        "long_score":         round(ls, 2),
+        "short_score":        round(ss, 2),
         "categories": {
             "trend":       {"long": round(float(row["trend_l"]),2), "short": round(float(row["trend_s"]),2)},
             "zone":        {"long": round(float(row["zone_l"]), 2), "short": round(float(row["zone_s"]), 2)},
             "momentum":    {"long": round(float(row["mom_l"]),  2), "short": round(float(row["mom_s"]),  2)},
             "positioning": {"long": round(float(row["pos_l"]),  2), "short": round(float(row["pos_s"]),  2)},
         },
-        "volume_profile": {"poc": round(poc_v,2), "vah": round(vah_v,2), "val": round(val_v,2)},
-        "reasons_long":   reasons_long,
-        "reasons_short":  reasons_short,
-        "entry_plan":     entry_plan,
+        "volume_profile":     {"poc": round(poc_v,2), "vah": round(vah_v,2), "val": round(val_v,2)},
+        "reasons_long":       reasons_long,
+        "reasons_short":      reasons_short,
+        "entry_plan":         entry_plan,
         "indicators": {
             "rsi":          round(rsi_v, 2),
             "mfi":          round(mfi_v, 2),
@@ -1089,9 +1112,14 @@ def get_signal():
             "real_buying":  bool(row.get("real_buying")),
             "real_selling": bool(row.get("real_selling")),
         },
-        "df": df,
-      "intelligence": intel,
-      "execution_decision": intel.get("execution")
+        "df":                 df,
+        # Intelligence layer outputs
+        "intelligence":       intel,
+        "execution_decision": intel.get("execution"),
+        "research_confidence":intel.get("confidence", 50.0),
+        "execution_approved": intel.get("execution_approved", True),
+        "sentiment":          intel.get("sentiment", "NEUTRAL"),
+        "market_alignment":   intel.get("alignment",  "NEUTRAL"),
     }
 
 
@@ -1143,21 +1171,20 @@ def get_learning_summary():
 # GOOGLE SHEETS LOGGING
 # ══════════════════════════════════════════════════════════════════
 
-def log_signal_to_sheets(sig: dict):
+def log_to_sheets(data: dict):
     if not SHEETS_URL: return
-    try:
-        payload = {
-            "timestamp":   sig.get("timestamp", ""),
-            "direction":   sig.get("direction", ""),
-            "price":       sig.get("price", 0),
-            "regime":      sig.get("regime", ""),
-            "long_score":  sig.get("long_score", 0),
-            "short_score": sig.get("short_score", 0),
-        }
-        requests.post(SHEETS_URL, json=payload, timeout=10)
+    try: requests.post(SHEETS_URL, json=data, timeout=10)
     except: pass
 
+def log_signal_to_sheets(sig: dict):
+    log_to_sheets({
+        "timestamp":   sig.get("timestamp", ""),
+        "direction":   sig.get("direction", ""),
+        "price":       sig.get("price", 0),
+        "regime":      sig.get("regime", ""),
+        "long_score":  sig.get("long_score", 0),
+        "short_score": sig.get("short_score", 0),
+    })
+
 def log_trade_to_sheets(trade: dict):
-    if not SHEETS_URL: return
-    try: requests.post(SHEETS_URL, json=trade, timeout=10)
-    except: pass
+    log_to_sheets({**trade, "type": "TRADE"})
