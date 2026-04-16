@@ -6,6 +6,7 @@ Regime-Aware · 5-Signal Voting · Volume Profile · Intelligence Layer
 import os, sys, json, time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from tab_paper_trading import render_paper_trading_tab
 
 # ── Path setup — must come before any local imports ───────────────
 _root = Path(__file__).parent.parent
@@ -103,7 +104,9 @@ st.markdown("## ₿ BTC Strategy v8.5")
 st.caption(f"Regime-Aware · 5-Signal Voting · Volume Profile · {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
 
 # ── Tab definition (5 tabs: Intelligence tab added) ───────────────
-_tab_labels = ["📡 Signal", "📊 Backtest", "📋 History", "🧠 Learn", "🔬 Intelligence"]
+tab_signal, tab_backtest, tab_history, tab_learn, tab_intel, tab_paper = st.tabs(
+    ["📡 Signal", "📊 Backtest", "📋 History", "🧠 Learn", "🔬 Intelligence", "📄 Paper Trading"]
+)
 tab_signal, tab_backtest, tab_history, tab_learn, tab_intel = st.tabs(_tab_labels)
 
 
@@ -571,3 +574,7 @@ with tab_intel:
         To enable: commit `intelligence/` and `execution/` folders to your repo,
         and add `feedparser` and `vaderSentiment` to `requirements.txt`.
         """)
+
+
+with tab_paper:
+    render_paper_trading_tab()
