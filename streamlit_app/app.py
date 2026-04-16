@@ -107,7 +107,7 @@ st.caption(f"Regime-Aware · 5-Signal Voting · Volume Profile · {datetime.now(
 tab_signal, tab_backtest, tab_history, tab_learn, tab_intel, tab_paper = st.tabs(
     ["📡 Signal", "📊 Backtest", "📋 History", "🧠 Learn", "🔬 Intelligence", "📄 Paper Trading"]
 )
-tab_signal, tab_backtest, tab_history, tab_learn, tab_intel = st.tabs(_tab_labels)
+# tab_signal, tab_backtest, tab_history, tab_learn, tab_intel = st.tabs(_tab_labels)
 
 
 # ══════════════════════════════════════════════════════════════════
