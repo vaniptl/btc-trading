@@ -1,0 +1,67 @@
+name: Paper Trading Bot — 24/7
+
+on:
+  workflow_dispatch:         # start manually from GitHub UI
+  schedule:
+    - cron: "*/5 * * * *"   # keep-alive ping every 5 min (restarts if crashed)
+
+jobs:
+  paper-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6       # slightly over 5min so always running
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install requests pandas numpy python-telegram-bot feedparser vaderSentiment
+
+      - name: Restore paper trading state
+        uses: actions/cache@v4
+        with:
+          path: paper_trading/
+          key: paper-state-${{ github.run_id }}
+          restore-keys: paper-state-
+
+      - name: Run paper bot (single iteration)
+        env:
+          CRYPTOCOMPARE_API_KEY:   ${{ secrets.CRYPTOCOMPARE_API_KEY }}
+          TELEGRAM_BOT_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS:       ${{ secrets.TELEGRAM_CHAT_IDS }}
+          GOOGLE_SHEETS_WEBHOOK:   ${{ secrets.GOOGLE_SHEETS_WEBHOOK }}
+          PAPER_CAPITAL:           "10000"
+          PAPER_CHECK_INTERVAL:    "60"
+          PAPER_MAX_DAILY_LOSS:    "0.05"
+          PAPER_MAX_CONCURRENT:    "2"
+          PAPER_COOLDOWN_LOSSES:   "3"
+          PAPER_COOLDOWN_HOURS:    "4"
+          PAPER_KELLY_FRACTION:    "0.25"
+          # Signal sensitivity env vars
+          MIN_SCORE:               "4.0"
+          MIN_CATEGORIES:          "2"
+          TREND_REQUIRED:          "true"
+          ATR_SL_MULT:             "2.0"
+          ATR_TP_MULT:             "4.0"
+          ENABLE_SHORTS:           "true"
+        run: |
+          mkdir -p paper_trading
+          python paper_trading/paper_bot.py
+
+      - name: Save paper trading state
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: paper_trading/
+          key: paper-state-${{ github.run_id }}
