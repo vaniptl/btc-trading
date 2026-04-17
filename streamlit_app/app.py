@@ -47,11 +47,11 @@ st.markdown("""
 # SAFE IMPORTS
 # ══════════════════════════════════════════════════════════════════
 
-@st.cache_resource(show_spinner=False)
 def _import_runner():
     try:
-        import signal_runner as sr
-        return sr
+        import importlib, signal_runner as _sr
+        importlib.reload(_sr)          # always reload so file changes take effect
+        return _sr
     except Exception as e:
         return None
 
@@ -424,7 +424,10 @@ with tab_backtest:
         if submitted:
             with st.spinner("Running backtest…"):
                 try:
-                    result = sr.run_backtest(period=period, tf=tf, capital=capital)
+                    # Re-import fresh in case module was cached without run_backtest
+                    import importlib, signal_runner as _sr_bt
+                    importlib.reload(_sr_bt)
+                    result = _sr_bt.run_backtest(period=period, tf=tf, capital=capital)
                     if result:
                         r1, r2, r3, r4, r5 = st.columns(5)
                         r1.metric("Return",       f"{result.get('total_return',0):.1%}")
