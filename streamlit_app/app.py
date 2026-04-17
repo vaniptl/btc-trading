@@ -187,19 +187,15 @@ def _mini_bar(value: float, label: str, max_val: float = 100,
 
 
 # ══════════════════════════════════════════════════════════════════
-# TAB 1 — SIGNAL
+# GLOBAL SIGNAL FETCH  (shared across all tabs)
 # ══════════════════════════════════════════════════════════════════
 
-with tab_signal:
-    col_refresh, _ = st.columns([1, 5])
-    with col_refresh:
-        do_refresh = st.button("🔄 Refresh", use_container_width=True)
+# Refresh button lives outside any tab so the cached value is shared
+_refresh_col, _ = st.columns([1, 5])
+with _refresh_col:
+    do_refresh = st.button("🔄 Refresh", use_container_width=True)
 
-    # ── Fetch signal ──────────────────────────────────────────────
-    if sr is None:
-        st.error("signal_runner.py could not be imported. Check deployment logs.")
-        st.stop()
-
+if sr is not None:
     @st.cache_data(ttl=300, show_spinner="Fetching signal…")
     def _fetch():
         return sr.get_signal()
@@ -212,6 +208,21 @@ with tab_signal:
     except Exception as e:
         st.error(f"Signal fetch failed: {e}")
         sig = {}
+else:
+    sig = {}
+
+# Pull intelligence sub-dict at top level so Intelligence tab can use it
+_intel_data = sig.get("intelligence", {}) if sig else {}
+
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 1 — SIGNAL
+# ══════════════════════════════════════════════════════════════════
+
+with tab_signal:
+    if sr is None:
+        st.error("signal_runner.py could not be imported. Check deployment logs.")
+        st.stop()
 
     direction  = sig.get("direction", "NO SIGNAL")
     price      = sig.get("price", 0)
@@ -507,7 +518,7 @@ with tab_learn:
 
 with tab_intel:
     if INTEL_OK:
-        render_intelligence_tab()
+        render_intelligence_tab(sig=sig, intel=_intel_data)
     else:
         st.markdown("## 🔬 Intelligence")
         st.warning("Intelligence layer not available. Check that `tab_intelligence.py` is in `streamlit_app/`.")
