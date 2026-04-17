@@ -1,67 +1,77 @@
-name: Paper Trading Bot — 24/7
+name: Paper Trading Bot — Cron
+
+# WHY THIS PATTERN:
+# GitHub Actions kills jobs after ~6 minutes for free tier.
+# A "while True" loop inside the job causes timeout/kill.
+# Solution: run ONE signal check per job invocation.
+# The cron schedule (every 5 min) is the "loop" — Actions restarts the job.
+# State (open trades, account value) persists via GitHub Actions cache.
 
 on:
-  workflow_dispatch:         # start manually from GitHub UI
+  workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"   # keep-alive ping every 5 min (restarts if crashed)
+    - cron: "*/5 * * * *"    # every 5 minutes = the loop
 
 jobs:
-  paper-bot:
+  paper-signal-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 6       # slightly over 5min so always running
+    timeout-minutes: 4        # hard kill at 4min, well within 5min cadence
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip
+      - name: Cache pip deps
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          key: pip-paper-${{ hashFiles('requirements.txt') }}
+          restore-keys: pip-paper-
 
-      - name: Install dependencies
-        run: pip install requests pandas numpy python-telegram-bot feedparser vaderSentiment
+      - name: Install deps
+        run: |
+          pip install --quiet requests pandas numpy feedparser vaderSentiment
 
-      - name: Restore paper trading state
+      - name: Restore trading state
         uses: actions/cache@v4
         with:
           path: paper_trading/
-          key: paper-state-${{ github.run_id }}
-          restore-keys: paper-state-
+          key: paper-state-v2-${{ github.ref }}
+          restore-keys: paper-state-v2-
 
-      - name: Run paper bot (single iteration)
+      - name: Create dirs
+        run: mkdir -p paper_trading data
+
+      - name: Run single signal check
+        timeout-minutes: 3
         env:
-          CRYPTOCOMPARE_API_KEY:   ${{ secrets.CRYPTOCOMPARE_API_KEY }}
-          TELEGRAM_BOT_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_IDS:       ${{ secrets.TELEGRAM_CHAT_IDS }}
-          GOOGLE_SHEETS_WEBHOOK:   ${{ secrets.GOOGLE_SHEETS_WEBHOOK }}
-          PAPER_CAPITAL:           "10000"
-          PAPER_CHECK_INTERVAL:    "60"
-          PAPER_MAX_DAILY_LOSS:    "0.05"
-          PAPER_MAX_CONCURRENT:    "2"
-          PAPER_COOLDOWN_LOSSES:   "3"
-          PAPER_COOLDOWN_HOURS:    "4"
-          PAPER_KELLY_FRACTION:    "0.25"
-          # Signal sensitivity env vars
-          MIN_SCORE:               "4.0"
-          MIN_CATEGORIES:          "2"
-          TREND_REQUIRED:          "true"
-          ATR_SL_MULT:             "2.0"
-          ATR_TP_MULT:             "4.0"
-          ENABLE_SHORTS:           "true"
+          CRYPTOCOMPARE_API_KEY: ${{ secrets.CRYPTOCOMPARE_API_KEY }}
+          TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS:     ${{ secrets.TELEGRAM_CHAT_IDS }}
+          GOOGLE_SHEETS_WEBHOOK: ${{ secrets.GOOGLE_SHEETS_WEBHOOK }}
+          PAPER_CAPITAL:         "10000"
+          PAPER_CHECK_INTERVAL:  "60"
+          PAPER_MAX_DAILY_LOSS:  "0.05"
+          PAPER_MAX_CONCURRENT:  "2"
+          PAPER_COOLDOWN_LOSSES: "3"
+          PAPER_COOLDOWN_HOURS:  "4"
+          PAPER_KELLY_FRACTION:  "0.25"
+          ENABLE_SHORTS:         "true"
+          MIN_SCORE:             "4.0"
+          # Tells the bot to run ONE check and exit cleanly
+          PAPER_SINGLE_SHOT:     "true"
         run: |
-          mkdir -p paper_trading
+          cd ${{ github.workspace }}
           python paper_trading/paper_bot.py
 
-      - name: Save paper trading state
+      - name: Save trading state
         if: always()
         uses: actions/cache@v4
         with:
           path: paper_trading/
-          key: paper-state-${{ github.run_id }}
+          key: paper-state-v2-${{ github.ref }}
