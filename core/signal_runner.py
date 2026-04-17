@@ -1188,3 +1188,166 @@ def log_signal_to_sheets(sig: dict):
 
 def log_trade_to_sheets(trade: dict):
     log_to_sheets({**trade, "type": "TRADE"})
+
+
+# ══════════════════════════════════════════════════════════════════
+# BACKTEST ENGINE  (added fix — was missing, caused AttributeError)
+# ══════════════════════════════════════════════════════════════════
+
+def run_backtest(period: str = "3M", tf: str = "1H", capital: float = 10_000) -> dict:
+    """
+    Vectorised walk-forward backtest using the v8.5 signal engine.
+
+    Parameters
+    ----------
+    period  : "1M" | "3M" | "6M" | "1Y"
+    tf      : "1H" | "4H" | "1D"
+    capital : starting capital in USD
+
+    Returns
+    -------
+    dict with keys:
+        total_return, sharpe, max_dd, num_trades, win_rate,
+        equity_curve (list[float]), run_history (list[dict])
+    """
+    import traceback
+
+    # ── 1. Map period / timeframe to fetch params ─────────────────
+    period_days = {"1M": 30, "3M": 90, "6M": 180, "1Y": 365}.get(period, 90)
+    tf_map = {
+        "1H": ("hour", 1,  "1h"),
+        "4H": ("hour", 4,  "4h"),
+        "1D": ("day",  1,  "1d"),
+    }
+    unit, agg, interval = tf_map.get(tf, ("hour", 1, "1h"))
+
+    # need extra history for indicators (200-bar EMA needs ~200 bars before test window)
+    fetch_days = period_days + 30   # buffer for indicator warm-up
+
+    try:
+        df_main = fetch_ohlcv(unit, agg, days_back=fetch_days)
+        if df_main.empty:
+            return {"error": "No OHLCV data returned from exchange"}
+
+        # Supplementary timeframes for indicator computation
+        df_4h = fetch_ohlcv("hour", 4, days_back=fetch_days + 10)
+        df_1d = fetch_ohlcv("day",  1, days_back=fetch_days + 10)
+
+        # Empty liquidation / funding / OI placeholders (backtest mode)
+        liq_df  = pd.DataFrame()
+        fund_df = pd.DataFrame()
+        oi_df   = pd.DataFrame()
+
+    except Exception as e:
+        return {"error": f"Data fetch failed: {e}"}
+
+    try:
+        df_ind = compute_indicators(df_main, df_4h, df_1d, liq_df, fund_df, oi_df)
+    except Exception as e:
+        return {"error": f"Indicator computation failed: {e}\n{traceback.format_exc()[:400]}"}
+
+    # ── 2. Detect regime on full dataset then score ───────────────
+    try:
+        regime, _ = detect_regime(df_ind, df_4h_ext=df_4h, df_1d_ext=df_1d)
+        rcfg      = get_regime_config(regime)
+        df_ind    = compute_scores_regime(df_ind, regime, MIN_CATS, TREND_REQ)
+    except Exception as e:
+        return {"error": f"Regime/scoring failed: {e}"}
+
+    sl_mult = rcfg.get("atr_sl_mult", ATR_SL)
+    tp_mult = rcfg.get("atr_tp_mult", ATR_TP)
+
+    # ── 3. Trim to requested period (after warm-up) ───────────────
+    cutoff = df_ind.index[-1] - pd.Timedelta(days=period_days)
+    df_bt  = df_ind[df_ind.index >= cutoff].copy()
+
+    if len(df_bt) < 10:
+        return {"error": f"Only {len(df_bt)} bars after trim — not enough data for backtest"}
+
+    # ── 4. Walk-forward simulation ────────────────────────────────
+    equity       = capital
+    equity_curve = [capital]
+    trades       = []
+    in_trade     = False
+    entry_price  = 0.0
+    stop_loss    = 0.0
+    take_profit  = 0.0
+    direction    = "NONE"
+
+    for i, (ts, row) in enumerate(df_bt.iterrows()):
+        close = float(row["close"])
+        atr   = float(row.get("atr", close * 0.01))
+
+        # ── Exit logic ────────────────────────────────────────────
+        if in_trade:
+            hit_sl = (direction == "LONG"  and close <= stop_loss) or \
+                     (direction == "SHORT" and close >= stop_loss)
+            hit_tp = (direction == "LONG"  and close >= take_profit) or \
+                     (direction == "SHORT" and close <= take_profit)
+
+            if hit_sl or hit_tp:
+                exit_price = stop_loss if hit_sl else take_profit
+                pnl_pct    = (exit_price - entry_price) / entry_price
+                if direction == "SHORT":
+                    pnl_pct = -pnl_pct
+                pnl_usd    = equity * 0.10 * pnl_pct   # 10% risk per trade
+                equity    += pnl_usd
+                equity     = max(equity, 0)
+                trades.append({
+                    "ts":        str(ts)[:16],
+                    "direction": direction,
+                    "entry":     round(entry_price, 2),
+                    "exit":      round(exit_price, 2),
+                    "pnl_pct":   round(pnl_pct, 4),
+                    "pnl_usd":   round(pnl_usd, 2),
+                    "result":    "WIN" if pnl_pct > 0 else "LOSS",
+                    "exit_type": "TP" if hit_tp else "SL",
+                })
+                in_trade = False
+                equity_curve.append(round(equity, 2))
+
+        # ── Entry logic ───────────────────────────────────────────
+        if not in_trade:
+            long_sig  = bool(row.get("long_signal",  False))
+            short_sig = bool(row.get("short_signal", False))
+
+            if long_sig or short_sig:
+                direction   = "LONG" if long_sig else "SHORT"
+                entry_price = close
+                if direction == "LONG":
+                    stop_loss   = close - atr * sl_mult
+                    take_profit = close + atr * tp_mult
+                else:
+                    stop_loss   = close + atr * sl_mult
+                    take_profit = close - atr * tp_mult
+                in_trade = True
+
+    # ── 5. Compute summary metrics ────────────────────────────────
+    total_return = (equity - capital) / capital
+    num_trades   = len(trades)
+    wins         = [t for t in trades if t["result"] == "WIN"]
+    win_rate     = len(wins) / num_trades if num_trades > 0 else 0.0
+
+    # Sharpe ratio from equity curve returns
+    eq_arr   = np.array(equity_curve)
+    rets     = np.diff(eq_arr) / np.maximum(eq_arr[:-1], 1e-9)
+    sharpe   = float(rets.mean() / rets.std() * np.sqrt(len(rets))) if rets.std() > 1e-9 else 0.0
+
+    # Max drawdown
+    peak  = np.maximum.accumulate(eq_arr)
+    dd    = (eq_arr - peak) / np.maximum(peak, 1e-9)
+    max_dd = float(dd.min())
+
+    return {
+        "period":        period,
+        "timeframe":     tf,
+        "regime":        regime,
+        "total_return":  round(total_return, 4),
+        "sharpe":        round(sharpe, 3),
+        "max_dd":        round(max_dd, 4),
+        "num_trades":    num_trades,
+        "win_rate":      round(win_rate, 4),
+        "final_equity":  round(equity, 2),
+        "equity_curve":  equity_curve,
+        "run_history":   trades,
+    }
